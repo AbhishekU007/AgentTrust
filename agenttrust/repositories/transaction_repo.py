@@ -3,8 +3,9 @@
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import select, and_, func
+from sqlalchemy.exc import IntegrityError
 from agenttrust.interfaces import ITransactionRepository
-from agenttrust.db.schema import DBIntentMandate, DBAuditEvent, DBPaymentMandate
+from agenttrust.db.schema import DBConsumedIntent, DBPaymentMandate
 
 
 class SQLiteTransactionRepository(ITransactionRepository):
@@ -25,13 +26,13 @@ class SQLiteTransactionRepository(ITransactionRepository):
         return self.db.execute(stmt).scalar() or 0
     
     def is_intent_consumed(self, intent_id: str) -> bool:
-        # Check if a PaymentMandate already exists for this intent_id
-        stmt = select(DBPaymentMandate.payment_id).where(DBPaymentMandate.intent_id == intent_id)
+        stmt = select(DBConsumedIntent.intent_id).where(DBConsumedIntent.intent_id == intent_id)
         result = self.db.execute(stmt).first()
         return result is not None
     
     def mark_intent_consumed(self, intent_id: str) -> None:
-        # We don't need to do anything here because the engine will immediately
-        # create a PaymentMandate and persist it. 
-        # is_intent_consumed relies on checking the PaymentMandate table.
-        pass
+        try:
+            self.db.add(DBConsumedIntent(intent_id=intent_id))
+            self.db.commit()
+        except IntegrityError:
+            self.db.rollback()

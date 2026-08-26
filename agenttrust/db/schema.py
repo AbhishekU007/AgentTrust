@@ -1,7 +1,6 @@
 """SQLAlchemy schema models for AgentTrust."""
 
-from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime, Float, Boolean, JSON
+from sqlalchemy import Column, Integer, String, DateTime, JSON, Index
 from sqlalchemy.sql import func
 from agenttrust.db.database import Base
 
@@ -54,6 +53,23 @@ class DBPaymentMandate(Base):
     
     # Razorpay integration
     razorpay_order_id = Column(String, nullable=True, unique=True, index=True)
+    payment_execution_status = Column(String, nullable=False, default="NOT_EXECUTED")
+    payment_execution_error = Column(String, nullable=True)
+    payment_executed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class DBAuthorizationDecision(Base):
+    __tablename__ = "authorization_decisions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    decision_id = Column(String, nullable=False, unique=True, index=True)
+    intent_id = Column(String, nullable=False, index=True)
+    cart_id = Column(String, nullable=True, index=True)
+    status = Column(String, nullable=False, index=True)
+    reason = Column(String, nullable=False)
+    checks = Column(JSON, nullable=False)
+    payment_id = Column(String, nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class DBAuditEvent(Base):
@@ -93,6 +109,12 @@ class DBConsumedNonce(Base):
     )
 
 
-# Manually create unique index to bypass SQLAlchemy declarative limitations in some SQLite versions
-from sqlalchemy import Index
-Index('idx_type_nonce_unique', DBConsumedNonce.mandate_type, DBConsumedNonce.nonce, unique=True)
+class DBConsumedIntent(Base):
+    __tablename__ = "consumed_intents"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    intent_id = Column(String, nullable=False, unique=True, index=True)
+    consumed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+Index("idx_type_nonce_unique", DBConsumedNonce.mandate_type, DBConsumedNonce.nonce, unique=True)

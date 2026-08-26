@@ -1,6 +1,5 @@
 """SQLite-backed Replay Repository."""
 
-import sqlite3
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from agenttrust.interfaces import IReplayRegistry

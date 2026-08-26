@@ -28,7 +28,6 @@ from agenttrust.models import (
     PolicyConfig,
 )
 from agenttrust.interfaces import IAuditLog, IReplayRegistry, ITransactionRepository
-from agenttrust.audit import AuditLog
 from agenttrust.policy import evaluate_policy
 from agenttrust.verification import verify_intent_cart_consistency
 
@@ -77,6 +76,8 @@ class AuthorizationEngine:
         audit_log: IAuditLog | None = None,
         replay_registry: IReplayRegistry | None = None,
         transaction_repo: ITransactionRepository | None = None,
+        system_private_key: Ed25519PrivateKey | None = None,
+        system_public_key: Ed25519PublicKey | None = None,
     ) -> None:
         self.policy = policy
         self.audit = audit_log if audit_log is not None else AuditLog()
@@ -84,7 +85,15 @@ class AuthorizationEngine:
         self._transaction_repo = transaction_repo if transaction_repo is not None else InMemoryTransactionRepository()
 
         # AgentTrust System Key (Used to sign PaymentMandates to prove authorization)
-        self._system_private_key, self._system_public_key = generate_keypair()
+        if system_private_key is not None:
+            self._system_private_key = system_private_key
+            self._system_public_key = (
+                system_public_key if system_public_key is not None else system_private_key.public_key()
+            )
+        elif system_public_key is not None:
+            raise ValueError("system_private_key is required when supplying system_public_key")
+        else:
+            self._system_private_key, self._system_public_key = generate_keypair()
 
     @property
     def system_public_key(self) -> Ed25519PublicKey:
