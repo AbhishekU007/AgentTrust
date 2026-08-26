@@ -9,6 +9,8 @@ import logging
 from dataclasses import dataclass
 from sqlalchemy.orm import Session
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from agenttrust.db.schema import DBConsumedNonce
 from agenttrust.models import PaymentMandate
 from agenttrust.db.schema import DBPaymentMandate
 
@@ -47,10 +49,21 @@ class RazorpayAdapter:
         Creates a Razorpay order idempotently based on PaymentMandate ID.
         Returns a structured execution result.
         """
-        # 1. Idempotency Check: Do we already have an order for this payment?
+        # Reservation: attempt to reserve execution rights to prevent concurrent creators
+        try:
+            reservation = DBConsumedNonce(mandate_type="payment_execution", nonce=mandate.payment_id)
+            self.db.add(reservation)
+            self.db.commit()
+            reserved = True
+        except IntegrityError:
+            # Another worker already reserved or created this execution
+            self.db.rollback()
+            reserved = False
+
+        # Re-query DBPaymentMandate
         stmt = select(DBPaymentMandate).where(DBPaymentMandate.payment_id == mandate.payment_id)
         db_mandate = self.db.execute(stmt).scalar()
-        
+
         if db_mandate and db_mandate.razorpay_order_id:
             logger.info(f"Idempotent hit: Order {db_mandate.razorpay_order_id} already exists for Payment {mandate.payment_id}")
             return PaymentExecutionResult(
@@ -60,27 +73,46 @@ class RazorpayAdapter:
                 is_mocked=self.is_mocked,
             )
 
-        # 2. Create the order
-        if self.is_mocked:
-            # Mock behavior
-            order_id = f"order_mock_{uuid.uuid4().hex[:8]}"
-        else:
-            # Real Razorpay Test API call
-            # receipt is unique identifier for this transaction in our system
-            data = {
-                "amount": mandate.amount_minor,
-                "currency": mandate.currency,
-                "receipt": mandate.payment_id,
-                "notes": {
-                    "intent_id": mandate.intent_id,
-                    "cart_id": mandate.cart_id,
-                    "merchant": mandate.merchant
+        if not reserved:
+            # Someone else is likely creating it now; advise caller to retry later
+            return PaymentExecutionResult(
+                success=False,
+                order_id=None,
+                error_code="concurrent_execution_in_progress",
+                message="Another process is creating the Razorpay order; retry shortly",
+                is_mocked=self.is_mocked,
+            )
+
+        # 2. Create the order (we hold the reservation)
+        try:
+            if self.is_mocked:
+                # Mock behavior
+                order_id = f"order_mock_{uuid.uuid4().hex[:8]}"
+            else:
+                # Real Razorpay Test API call
+                # receipt is unique identifier for this transaction in our system
+                data = {
+                    "amount": mandate.amount_minor,
+                    "currency": mandate.currency,
+                    "receipt": mandate.payment_id,
+                    "notes": {
+                        "intent_id": mandate.intent_id,
+                        "cart_id": mandate.cart_id,
+                        "merchant": mandate.merchant
+                    }
                 }
-            }
-            try:
                 razorpay_order = self.client.order.create(data=data)
                 order_id = razorpay_order.get("id")
                 if not order_id:
+                    # On failure, release reservation so other attempts may try
+                    try:
+                        self.db.query(DBConsumedNonce).filter(
+                            DBConsumedNonce.mandate_type == "payment_execution",
+                            DBConsumedNonce.nonce == mandate.payment_id,
+                        ).delete()
+                        self.db.commit()
+                    except Exception:
+                        self.db.rollback()
                     return PaymentExecutionResult(
                         success=False,
                         order_id=None,
@@ -88,25 +120,32 @@ class RazorpayAdapter:
                         message="Razorpay response did not include order id",
                         is_mocked=False,
                     )
-            except Exception as e:
-                logger.error(f"Razorpay API error: {e}")
-                return PaymentExecutionResult(
-                    success=False,
-                    order_id=None,
-                    error_code="razorpay_api_error",
-                    message=str(e),
-                    is_mocked=False,
-                )
+        except Exception as e:
+            logger.error(f"Razorpay API error: {e}")
+            # Release reservation so retry can occur
+            try:
+                self.db.query(DBConsumedNonce).filter(
+                    DBConsumedNonce.mandate_type == "payment_execution",
+                    DBConsumedNonce.nonce == mandate.payment_id,
+                ).delete()
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+            return PaymentExecutionResult(
+                success=False,
+                order_id=None,
+                error_code="razorpay_api_error",
+                message=str(e),
+                is_mocked=False,
+            )
 
         # 3. Persist the order_id back to DB
         if db_mandate:
             db_mandate.razorpay_order_id = order_id
             self.db.commit()
         else:
-            # If the DBPaymentMandate was somehow not persisted yet, we could persist it now,
-            # but standard flow dictates engine persists it. We will log a warning.
             logger.warning("DBPaymentMandate not found to attach razorpay_order_id. This shouldn't happen if engine is called first.")
-        
+
         return PaymentExecutionResult(
             success=True,
             order_id=order_id,

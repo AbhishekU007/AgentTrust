@@ -332,7 +332,19 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
         try:
             _persist_intent(db, payload.intent)
             _persist_cart(db, payload.cart)
-            db.commit()
+            try:
+                db.commit()
+            except Exception as exc:
+                # Handle race where concurrent insertion of the same intent/cart
+                # violates unique constraints. Roll back and continue — the
+                # existing records are acceptable for authorization processing.
+                from sqlalchemy.exc import IntegrityError
+
+                if isinstance(exc, IntegrityError):
+                    db.rollback()
+                else:
+                    db.rollback()
+                    raise
 
             engine = _build_engine(db)
             result = engine.authorize(
