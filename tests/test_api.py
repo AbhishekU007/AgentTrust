@@ -6,7 +6,18 @@ from fastapi.testclient import TestClient
 
 from agenttrust.api import create_app
 from agenttrust.crypto import generate_keypair, sign_mandate
-from agenttrust.models import CartItem, CartMandate, IntentMandate
+from agenttrust.models import CartItem, CartMandate, IntentMandate, PolicyConfig
+
+
+def _test_policy():
+    return PolicyConfig(
+        max_transaction_amount_minor=500000,
+        merchant_allowlist=["Amazon"],
+        blocked_categories=["Weapons", "Gambling"],
+        velocity_limit=999999,
+        velocity_window_seconds=3600,
+        require_approval_above_minor=450000,
+    )
 
 
 def _intent_payload(intent: IntentMandate) -> dict:
@@ -45,7 +56,7 @@ def _build_signed_request(*, amount_minor: int = 479900) -> tuple[dict, IntentMa
 
 
 def test_health_endpoint_returns_ok() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(policy=_test_policy()))
     response = client.get("/health")
     assert response.status_code == 200
 
@@ -55,7 +66,7 @@ def test_health_endpoint_returns_ok() -> None:
 
 
 def test_authorize_valid_signed_payload_allows_and_creates_payment_mandate() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(policy=_test_policy()))
     payload, _, _ = _build_signed_request()
 
     response = client.post("/authorize", json=payload)
@@ -66,7 +77,7 @@ def test_authorize_valid_signed_payload_allows_and_creates_payment_mandate() -> 
 
 
 def test_authorize_invalid_signature_is_blocked() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(policy=_test_policy()))
     payload, _, _ = _build_signed_request()
 
     payload["intent_signature"] = "00" * 64
@@ -79,7 +90,7 @@ def test_authorize_invalid_signature_is_blocked() -> None:
 
 
 def test_signature_substitution_is_blocked() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(policy=_test_policy()))
     payload_a, _, _ = _build_signed_request()
     payload_b, intent_b, cart_b = _build_signed_request()
 
@@ -98,7 +109,7 @@ def test_signature_substitution_is_blocked() -> None:
 
 
 def test_authorize_rejects_malformed_crypto_material() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(policy=_test_policy()))
     payload, _, _ = _build_signed_request()
 
     payload["intent_signature"] = "not-a-real-signature"

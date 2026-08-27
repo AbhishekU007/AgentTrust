@@ -326,7 +326,15 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
         }
 
     @app.post("/authorize")
-    def authorize(payload: AuthorizeRequest) -> dict[str, Any]:
+    def authorize(payload: AuthorizeRequest, execute: bool = True) -> dict[str, Any]:
+        """
+        Authorization endpoint.
+
+        Query parameter `execute` controls whether an ALLOW result will immediately
+        execute the PaymentMandate via the Razorpay adapter. Default: True (legacy behavior).
+        When execute=False, the PaymentMandate is persisted but not executed; callers may
+        later call POST /payments/{payment_id}/execute to perform the external payment.
+        """
         parsed = _parse_crypto_material(payload)
         db = _open_db()
         try:
@@ -357,29 +365,33 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
             payment_execution: PaymentExecutionResult | None = None
             db_payment: DBPaymentMandate | None = None
 
+            # If the engine returned a PaymentMandate (ALLOW), always persist it.
             if result.payment_mandate is not None:
                 db_payment = _persist_payment_mandate(db, result.payment_mandate)
-                payment_execution = _execute_payment_with_adapter(
-                    db,
-                    result.payment_mandate,
-                    db_payment,
-                )
 
-                event_type = "PAYMENT_EXECUTION_SUCCESS" if payment_execution.success else "PAYMENT_EXECUTION_FAILED"
-                engine.audit.record(
-                    event_type=event_type,
-                    actor="system",
-                    intent_id=result.intent_id,
-                    cart_id=result.cart_id,
-                    decision=result.status,
-                    reason=payment_execution.message,
-                    data={
-                        "payment_id": result.payment_mandate.payment_id,
-                        "order_id": payment_execution.order_id,
-                        "is_mocked": payment_execution.is_mocked,
-                        "error_code": payment_execution.error_code,
-                    },
-                )
+                # Only execute the external payment if caller requested execution.
+                if execute:
+                    payment_execution = _execute_payment_with_adapter(
+                        db,
+                        result.payment_mandate,
+                        db_payment,
+                    )
+
+                    event_type = "PAYMENT_EXECUTION_SUCCESS" if payment_execution.success else "PAYMENT_EXECUTION_FAILED"
+                    engine.audit.record(
+                        event_type=event_type,
+                        actor="system",
+                        intent_id=result.intent_id,
+                        cart_id=result.cart_id,
+                        decision=result.status,
+                        reason=payment_execution.message,
+                        data={
+                            "payment_id": result.payment_mandate.payment_id,
+                            "order_id": payment_execution.order_id,
+                            "is_mocked": payment_execution.is_mocked,
+                            "error_code": payment_execution.error_code,
+                        },
+                    )
 
             _persist_decision(
                 db,
