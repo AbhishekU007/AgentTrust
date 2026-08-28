@@ -31,6 +31,7 @@ from agenttrust.models import (
     PaymentMandate,
     PolicyConfig,
 )
+from agenttrust.services.auth import Principal
 from agenttrust.policy import evaluate_policy
 from agenttrust.repositories.approval_repo import SQLiteApprovalRepository
 from agenttrust.repositories.audit_repo import SQLiteAuditLog
@@ -133,11 +134,17 @@ class ApprovalContinuationService:
         policy: PolicyConfig,
         system_private_key: Ed25519PrivateKey,
         system_public_key: Ed25519PublicKey,
+        system_key_id: str | None = None,
+        principal: Principal | None = None,
+        verification_keys: dict[str, Ed25519PublicKey] | None = None,
     ) -> None:
         self.db = db
         self.policy = policy
         self.system_private_key = system_private_key
         self.system_public_key = system_public_key
+        self.system_key_id = system_key_id
+        self.principal = principal
+        self.verification_keys = verification_keys or {}
 
     def continue_approval(self, approval_id: str) -> tuple[PaymentMandate, bool, str]:
         approval_record = self.db.get(DBApprovalRequest, approval_id)
@@ -282,6 +289,15 @@ class ApprovalContinuationService:
             _reject("continuation_race", "Approval continuation was claimed concurrently")
 
         try:
+            audit_context = (
+                {
+                    "principal_id": self.principal.principal_id,
+                    "account_id": self.principal.account_id,
+                    "system_key_id": self.system_key_id,
+                }
+                if self.principal
+                else {"system_key_id": self.system_key_id}
+            )
             with DatabaseUnitOfWork(self.db):
                 self.db.add(
                     DBPaymentMandate(
@@ -296,6 +312,9 @@ class ApprovalContinuationService:
                         status=payment.status.value,
                         created_at=payment.created_at,
                         system_signature=payment.system_signature,
+                        system_key_id=self.system_key_id,
+                        principal_id=self.principal.principal_id if self.principal else None,
+                        account_id=self.principal.account_id if self.principal else None,
                         payment_execution_status="NOT_EXECUTED",
                         approval_id=approval_id,
                         authorization_id=approval.authorization_id,
@@ -304,19 +323,20 @@ class ApprovalContinuationService:
                 audit = SQLiteAuditLog(self.db)
                 audit.record(
                     event_type="APPROVAL_CONTINUATION_STARTED",
-                    actor="system",
+                    actor=self.principal.principal_id if self.principal else "system",
                     intent_id=payment.intent_id,
                     cart_id=payment.cart_id,
                     reason="Approval continuation revalidated",
                     data={
                         "approval_id": approval_id,
                         "authorization_id": approval.authorization_id,
+                        **audit_context,
                     },
                     commit=False,
                 )
                 audit.record(
                     event_type="AUTHORIZATION_RESUMED",
-                    actor="system",
+                    actor=self.principal.principal_id if self.principal else "system",
                     intent_id=payment.intent_id,
                     cart_id=payment.cart_id,
                     decision="ALLOW",
@@ -324,12 +344,13 @@ class ApprovalContinuationService:
                     data={
                         "approval_id": approval_id,
                         "authorization_id": approval.authorization_id,
+                        **audit_context,
                     },
                     commit=False,
                 )
                 audit.record(
                     event_type="PAYMENT_MANDATE_CREATED_FROM_APPROVAL",
-                    actor="system",
+                    actor=self.principal.principal_id if self.principal else "system",
                     intent_id=payment.intent_id,
                     cart_id=payment.cart_id,
                     decision="ALLOW",
@@ -338,6 +359,7 @@ class ApprovalContinuationService:
                         "approval_id": approval_id,
                         "authorization_id": approval.authorization_id,
                         "payment_id": payment.payment_id,
+                        **audit_context,
                     },
                     commit=False,
                 )
@@ -393,7 +415,10 @@ class ApprovalContinuationService:
             signature = _decode_signature(record.system_signature)
         except (ApprovalContinuationError, ValueError, TypeError):
             _reject("continuation_corrupt", "Payment mandate signature evidence is invalid")
-        if not verify_signature(
-            payment.canonical_bytes(), signature, self.system_public_key
+        verification_key = self.system_public_key
+        if record.system_key_id:
+            verification_key = self.verification_keys.get(record.system_key_id)
+        if verification_key is None or not verify_signature(
+            payment.canonical_bytes(), signature, verification_key
         ):
             _reject("continuation_corrupt", "Payment mandate signature verification failed")

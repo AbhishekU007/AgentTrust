@@ -17,6 +17,27 @@ Environment variables (.env.example)
 - AGENTTRUST_DB_URL: optional database URL. Defaults to sqlite:///./agenttrust.db
 - RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET: Razorpay Test Mode credentials. When both are set, the application uses the real Razorpay Test API. Leave blank for local/mock mode.
 - LOG_LEVEL: logging verbosity (DEBUG, INFO, WARNING, ERROR)
+- AGENTTRUST_API_TOKENS: optional JSON map of bearer tokens to principal IDs.
+- AGENTTRUST_SYSTEM_PRIVATE_KEY: externally provisioned raw Ed25519 private key hex.
+- AGENTTRUST_SYSTEM_KEY_ID: non-secret active signing-key identifier.
+- AGENTTRUST_SYSTEM_PUBLIC_KEYS: JSON map of historical key IDs to public-key hex.
+
+Authentication
+--------------
+When `AGENTTRUST_API_TOKENS` is configured, authorization, approval, continuation,
+execution, and audit routes require `Authorization: Bearer <token>`. The server
+derives the principal from the configured token; request body actor/account fields
+are not trusted. `/health` is intentionally public and only checks database
+connectivity. With no token configuration, the pre-M3.9 local demo mode remains
+available for backwards-compatible development tests.
+
+System key identity and rotation
+--------------------------------
+Payment mandates persist only the non-secret `system_key_id`. The active private
+key is supplied externally through configuration. Retired public keys may be
+listed in `AGENTTRUST_SYSTEM_PUBLIC_KEYS` so old mandates remain verifiable after
+rotation. Unknown or unavailable key IDs fail closed. Private keys and bearer
+tokens are never persisted, audited, logged, or returned by the API.
 
 Razorpay adapter: mock vs real
 -----------------------------

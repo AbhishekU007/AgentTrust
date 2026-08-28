@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
-from fastapi import Body, FastAPI, HTTPException, status
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text, update
 from sqlalchemy.exc import IntegrityError
@@ -33,6 +33,7 @@ from agenttrust.db.schema import (
     DBCartMandate,
     DBIntentMandate,
     DBPaymentMandate,
+    DBSystemKey,
 )
 from agenttrust.db.unit_of_work import DatabaseUnitOfWork
 from agenttrust.engine import AuthorizationEngine
@@ -57,6 +58,12 @@ from agenttrust.services.approval_continuation import (
     ApprovalContinuationError,
     ApprovalContinuationService,
 )
+from agenttrust.services.auth import Principal, authenticate, configured_principals
+from agenttrust.services.system_identity import SystemIdentity, load_system_identity
+
+
+def _legacy_test_principal(principal: Principal | None) -> bool:
+    return False
 
 
 class AuthorizeRequest(BaseModel):
@@ -266,7 +273,13 @@ def _persist_cart(db: Session, cart: CartMandate) -> None:
             raise
 
 
-def _persist_payment_mandate(db: Session, payment: PaymentMandate) -> DBPaymentMandate:
+def _persist_payment_mandate(
+    db: Session,
+    payment: PaymentMandate,
+    *,
+    principal: Principal | None = None,
+    system_key_id: str | None = None,
+) -> DBPaymentMandate:
     existing = db.get(DBPaymentMandate, payment.payment_id)
     if existing is not None:
         return existing
@@ -284,6 +297,9 @@ def _persist_payment_mandate(db: Session, payment: PaymentMandate) -> DBPaymentM
         created_at=payment.created_at,
         system_signature=payment.system_signature or "",
         payment_execution_status="NOT_EXECUTED",
+        system_key_id=system_key_id,
+        principal_id=principal.principal_id if principal else None,
+        account_id=principal.account_id if principal else None,
     )
     db.add(record)
     db.flush()
@@ -300,6 +316,7 @@ def _persist_decision(
     intent_hash: str | None = None,
     cart_hash: str | None = None,
     decision_id: str | None = None,
+    principal: Principal | None = None,
 ) -> str:
     resolved_decision_id = decision_id or uuid.uuid4().hex
     db.add(
@@ -315,6 +332,8 @@ def _persist_decision(
             user_public_key=user_public_key,
             intent_hash=intent_hash,
             cart_hash=cart_hash,
+            principal_id=principal.principal_id if principal else None,
+            account_id=principal.account_id if principal else None,
         )
     )
     return resolved_decision_id
@@ -326,6 +345,7 @@ def _approval_for_authorization(
     authorization_id: str,
     result: AuthorizationResult,
     expires_at: datetime,
+    principal: Principal | None = None,
 ) -> ApprovalRequest:
     existing = SQLiteApprovalRepository(db).get_by_authorization_id(authorization_id)
     if existing is not None:
@@ -342,6 +362,11 @@ def _approval_for_authorization(
         expires_at=expires_at,
     )
     SQLiteApprovalRepository(db).create(approval)
+    if principal:
+        db.flush()
+        record = db.get(DBApprovalRequest, approval.approval_id)
+        record.principal_id = principal.principal_id
+        record.account_id = principal.account_id
     return approval
 
 
@@ -438,6 +463,7 @@ def _validate_payment_for_execution(
     record: DBPaymentMandate,
     policy: PolicyConfig,
     system_public_key,
+    verification_keys: dict[str, Any] | None = None,
 ) -> PaymentMandate:
     """Reconstruct and validate all persisted payment security context."""
     if record.status != AuthorizationStatus.ALLOW.value:
@@ -525,11 +551,22 @@ def _validate_payment_for_execution(
             ).model_dump(),
         )
     payment = _payment_from_db(record)
+    verification_key = system_public_key
+    if record.system_key_id:
+        verification_key = (verification_keys or {}).get(record.system_key_id)
+        if verification_key is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=ErrorResponse(
+                    code="payment_mandate_invalid",
+                    message="Payment mandate signing key is unavailable",
+                ).model_dump(),
+            )
     try:
         valid_signature = verify_signature(
             payment.canonical_bytes(),
             bytes.fromhex(record.system_signature),
-            system_public_key,
+            verification_key,
         )
     except (ValueError, TypeError):
         valid_signature = False
@@ -615,15 +652,56 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
     app = FastAPI(title="AgentTrust API", version="0.2.0")
     resolved_policy = policy or _default_policy()
     session_factory, local_engine = build_session_factory(database_url)
-    system_private_key, system_public_key = _system_keypair()
+    identity: SystemIdentity = load_system_identity()
+    system_private_key = identity.private_key
+    system_public_key = identity.public_key
 
     app.state.policy = resolved_policy
     app.state.session_factory = session_factory
     app.state.db_engine = local_engine
     app.state.system_private_key = system_private_key
     app.state.system_public_key = system_public_key
+    app.state.system_key_id = identity.key_id
+    app.state.system_verification_keys = identity.verification_keys
+    app.state.principals = configured_principals()
 
     init_db(local_engine)
+    with local_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT OR IGNORE INTO system_keys "
+                "(key_id, public_key, state, created_at) VALUES "
+                "(:key_id, :public_key, 'ACTIVE', :created_at)"
+            ),
+            {
+                "key_id": identity.key_id,
+                "public_key": identity.public_key.public_bytes_raw().hex(),
+                "created_at": datetime.now(timezone.utc),
+            },
+        )
+        connection.execute(
+            text(
+                "UPDATE system_keys SET public_key=:public_key, state='ACTIVE' "
+                "WHERE key_id=:key_id"
+            ),
+            {
+                "key_id": identity.key_id,
+                "public_key": identity.public_key.public_bytes_raw().hex(),
+            },
+        )
+        for key_id, public_key in identity.verification_keys.items():
+            connection.execute(
+                text(
+                    "INSERT OR IGNORE INTO system_keys "
+                    "(key_id, public_key, state, created_at) VALUES "
+                    "(:key_id, :public_key, 'RETIRED', :created_at)"
+                ),
+                {
+                    "key_id": key_id,
+                    "public_key": public_key.public_bytes_raw().hex(),
+                    "created_at": datetime.now(timezone.utc),
+                },
+            )
 
     def _build_engine(db: Session) -> AuthorizationEngine:
         return AuthorizationEngine(
@@ -637,6 +715,24 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
 
     def _open_db() -> Session:
         return app.state.session_factory()
+
+    def _principal(
+        authorization: str | None = Header(default=None),
+    ) -> Principal | None:
+        return authenticate(app.state.principals, authorization)
+
+    def _audit_context(principal: Principal | None) -> dict[str, str]:
+        return (
+            {
+                "principal_id": principal.principal_id,
+                "account_id": principal.account_id,
+            }
+            if principal
+            else {}
+        )
+
+    def _audit_actor(principal: Principal | None) -> str:
+        return principal.principal_id if principal else "system"
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -660,7 +756,20 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    def _load_approval(db: Session, approval_id: str) -> ApprovalRequest:
+    def _load_approval(
+        db: Session, approval_id: str, principal: Principal | None = None
+    ) -> ApprovalRequest:
+        record = db.get(DBApprovalRequest, approval_id)
+        if record is not None and principal and not _legacy_test_principal(principal) and (
+            record.principal_id != principal.principal_id
+            or record.account_id != principal.account_id
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ErrorResponse(
+                    code="approval_not_found", message="Approval request not found"
+                ).model_dump(),
+            )
         approval = SQLiteApprovalRepository(db).get(approval_id)
         if approval is None:
             raise HTTPException(
@@ -676,10 +785,23 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
         approval_id: str,
         payload: ApprovalDecisionRequest,
         decision: ApprovalStatus,
+        principal: Principal | None = None,
     ) -> ApprovalRequest:
         db = _open_db()
         try:
-            approval = _load_approval(db, approval_id)
+            approval = _load_approval(db, approval_id, principal)
+            if (
+                principal
+                and not _legacy_test_principal(principal)
+                and payload.decided_by != principal.principal_id
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=ErrorResponse(
+                        code="approver_identity_mismatch",
+                        message="decided_by must match the authenticated principal",
+                    ).model_dump(),
+                )
             now = payload.decided_at
             if now.tzinfo is None:
                 now = now.replace(tzinfo=timezone.utc)
@@ -742,11 +864,14 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                         ) from exc
                     SQLiteAuditLog(db).record(
                         event_type="APPROVAL_EXPIRED",
-                        actor="system",
+                        actor=_audit_actor(principal),
                         intent_id=approval.intent_id,
                         cart_id=approval.cart_id,
                         reason="Approval expired before a decision was made",
-                        data={"approval_id": approval.approval_id},
+                        data={
+                            "approval_id": approval.approval_id,
+                            **_audit_context(principal),
+                        },
                     )
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
@@ -789,6 +914,7 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                     "approver_id": approval.decided_by,
                     "approver_public_key": approval.approver_public_key,
                     "decision_signature": approval.decision_signature,
+                    **_audit_context(principal),
                 },
             )
             return approval
@@ -796,28 +922,36 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
             db.close()
 
     @app.get("/approvals/{approval_id}", response_model=ApprovalRequest)
-    def get_approval(approval_id: str) -> ApprovalRequest:
+    def get_approval(
+        approval_id: str, principal: Principal | None = Depends(_principal)
+    ) -> ApprovalRequest:
         db = _open_db()
         try:
-            return _load_approval(db, approval_id)
+            return _load_approval(db, approval_id, principal)
         finally:
             db.close()
 
     @app.post("/approvals/{approval_id}/approve", response_model=ApprovalRequest)
     def approve_approval(
-        approval_id: str, payload: ApprovalDecisionRequest
+        approval_id: str,
+        payload: ApprovalDecisionRequest,
+        principal: Principal | None = Depends(_principal),
     ) -> ApprovalRequest:
-        return _decide_approval(approval_id, payload, ApprovalStatus.APPROVED)
+        return _decide_approval(approval_id, payload, ApprovalStatus.APPROVED, principal)
 
     @app.post("/approvals/{approval_id}/reject", response_model=ApprovalRequest)
     def reject_approval(
-        approval_id: str, payload: ApprovalDecisionRequest
+        approval_id: str,
+        payload: ApprovalDecisionRequest,
+        principal: Principal | None = Depends(_principal),
     ) -> ApprovalRequest:
-        return _decide_approval(approval_id, payload, ApprovalStatus.REJECTED)
+        return _decide_approval(approval_id, payload, ApprovalStatus.REJECTED, principal)
 
     @app.post("/approvals/{approval_id}/continue")
     def continue_approval(
-        approval_id: str, payload: EmptyContinuationRequest | None = Body(default=None)
+        approval_id: str,
+        payload: EmptyContinuationRequest | None = Body(default=None),
+        principal: Principal | None = Depends(_principal),
     ) -> dict[str, Any]:
         if not approval_id.strip():
             raise HTTPException(
@@ -829,11 +963,15 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
             )
         db = _open_db()
         try:
+            _load_approval(db, approval_id, principal)
             service = ApprovalContinuationService(
                 db=db,
                 policy=app.state.policy,
                 system_private_key=app.state.system_private_key,
                 system_public_key=app.state.system_public_key,
+                system_key_id=app.state.system_key_id,
+                principal=principal,
+                verification_keys=app.state.system_verification_keys,
             )
             try:
                 payment, already_completed, authorization_id = (
@@ -847,9 +985,13 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                 )
                 SQLiteAuditLog(db).record(
                     event_type=event_type,
-                    actor="system",
+                    actor=_audit_actor(principal),
                     reason=str(exc),
-                    data={"approval_id": approval_id, "error_code": exc.code},
+                    data={
+                        "approval_id": approval_id,
+                        "error_code": exc.code,
+                        **_audit_context(principal),
+                    },
                 )
                 raise HTTPException(
                     status_code=(
@@ -867,7 +1009,7 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
             if already_completed:
                 audit.record(
                     event_type="APPROVAL_CONTINUATION_ALREADY_COMPLETED",
-                    actor="system",
+                    actor=_audit_actor(principal),
                     intent_id=payment.intent_id,
                     cart_id=payment.cart_id,
                     reason="Returning the existing continuation payment mandate",
@@ -875,6 +1017,7 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                         "approval_id": approval_id,
                         "authorization_id": authorization_id,
                         "payment_id": payment.payment_id,
+                        **_audit_context(principal),
                     },
                 )
             return {
@@ -887,7 +1030,11 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
             db.close()
 
     @app.post("/authorize")
-    def authorize(payload: AuthorizeRequest, execute: bool = True) -> dict[str, Any]:
+    def authorize(
+        payload: AuthorizeRequest,
+        execute: bool = True,
+        principal: Principal | None = Depends(_principal),
+    ) -> dict[str, Any]:
         """
         Authorization endpoint.
 
@@ -917,7 +1064,12 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
 
             # If the engine returned a PaymentMandate (ALLOW), always persist it.
             if result.payment_mandate is not None:
-                db_payment = _persist_payment_mandate(db, result.payment_mandate)
+                db_payment = _persist_payment_mandate(
+                    db,
+                    result.payment_mandate,
+                    principal=principal,
+                    system_key_id=app.state.system_key_id,
+                )
 
                 # Only execute the external payment if caller requested execution.
                 if execute:
@@ -930,7 +1082,7 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                     event_type = "PAYMENT_EXECUTION_SUCCESS" if payment_execution.success else "PAYMENT_EXECUTION_FAILED"
                     engine.audit.record(
                         event_type=event_type,
-                        actor="system",
+                        actor=_audit_actor(principal),
                         intent_id=result.intent_id,
                         cart_id=result.cart_id,
                         decision=result.status,
@@ -940,6 +1092,7 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                             "order_id": payment_execution.order_id,
                             "is_mocked": payment_execution.is_mocked,
                             "error_code": payment_execution.error_code,
+                            **_audit_context(principal),
                         },
                     )
 
@@ -951,6 +1104,29 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                 user_public_key=payload.user_public_key,
                 intent_hash=payload.intent.compute_hash(),
                 cart_hash=payload.cart.compute_hash(),
+                principal=principal,
+            )
+            engine.audit.record(
+                event_type="AUTHORIZATION_PERSISTED",
+                actor=_audit_actor(principal),
+                intent_id=result.intent_id,
+                cart_id=result.cart_id,
+                decision=result.status,
+                reason=result.reason,
+                data={
+                    "authorization_id": decision_id,
+                    "payment_id": (
+                        result.payment_mandate.payment_id
+                        if result.payment_mandate
+                        else None
+                    ),
+                    "system_key_id": (
+                        app.state.system_key_id
+                        if result.payment_mandate is not None
+                        else None
+                    ),
+                    **_audit_context(principal),
+                },
             )
             if db_payment is not None:
                 db_payment.authorization_id = decision_id
@@ -961,6 +1137,7 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                     authorization_id=decision_id,
                     result=result,
                     expires_at=payload.intent.expires_at,
+                    principal=principal,
                 )
                 engine.audit.record(
                     event_type="APPROVAL_REQUESTED",
@@ -972,6 +1149,7 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                     data={
                         "approval_id": approval.approval_id,
                         "authorization_id": approval.authorization_id,
+                        **_audit_context(principal),
                     },
                 )
                 response["approval"] = approval.model_dump(mode="json")
@@ -992,7 +1170,9 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
         finally:
             db.close()
 
-    def _execute_payment_request(payment_id: str) -> ExecutePaymentResponse:
+    def _execute_payment_request(
+        payment_id: str, principal: Principal | None = None
+    ) -> ExecutePaymentResponse:
         db = _open_db()
         try:
             db_payment = db.get(DBPaymentMandate, payment_id)
@@ -1004,12 +1184,28 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                         message="Payment mandate not found",
                     ).model_dump(),
                 )
+            if principal and not _legacy_test_principal(principal):
+                has_owner_data = (
+                    db_payment.principal_id is not None or db_payment.account_id is not None
+                )
+                if has_owner_data and (
+                    db_payment.principal_id != principal.principal_id
+                    or db_payment.account_id != principal.account_id
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=ErrorResponse(
+                            code="payment_not_found",
+                            message="Payment mandate not found",
+                        ).model_dump(),
+                    )
 
             payment_mandate = _validate_payment_for_execution(
                 db,
                 db_payment,
                 app.state.policy,
                 app.state.system_public_key,
+                app.state.system_verification_keys,
             )
             existing_order_id, claimed = _claim_payment_execution(db, db_payment)
             if not claimed:
@@ -1021,18 +1217,22 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                 )
                 SQLiteAuditLog(db).record(
                     event_type="PAYMENT_EXECUTION_ALREADY_COMPLETED",
-                    actor="system",
+                    actor=_audit_actor(principal),
                     intent_id=db_payment.intent_id,
                     cart_id=db_payment.cart_id,
                     decision=AuthorizationStatus.ALLOW,
                     reason=execution.message,
-                    data={"payment_id": payment_id, "order_id": existing_order_id},
+                    data={
+                        "payment_id": payment_id,
+                        "order_id": existing_order_id,
+                        **_audit_context(principal),
+                    },
                 )
             else:
                 audit = SQLiteAuditLog(db)
                 audit.record(
                     event_type="PAYMENT_EXECUTION_STARTED",
-                    actor="system",
+                    actor=_audit_actor(principal),
                     intent_id=db_payment.intent_id,
                     cart_id=db_payment.cart_id,
                     decision=AuthorizationStatus.ALLOW,
@@ -1040,6 +1240,7 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                     data={
                         "payment_id": payment_id,
                         "execution_id": db_payment.payment_execution_id,
+                        **_audit_context(principal),
                     },
                 )
                 try:
@@ -1065,7 +1266,7 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                         if execution.success
                         else "PAYMENT_EXECUTION_FAILED"
                     ),
-                    actor="system",
+                    actor=_audit_actor(principal),
                     intent_id=db_payment.intent_id,
                     cart_id=db_payment.cart_id,
                     decision=AuthorizationStatus.ALLOW,
@@ -1075,6 +1276,7 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                         "order_id": execution.order_id,
                         "is_mocked": execution.is_mocked,
                         "error_code": execution.error_code,
+                        **_audit_context(principal),
                     },
                 )
                 db.commit()
@@ -1101,24 +1303,37 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
     def execute_payment_mandate(
         payment_id: str,
         payload: ExecutePaymentRequest | None = Body(default=None),
+        principal: Principal | None = Depends(_principal),
     ) -> ExecutePaymentResponse:
-        return _execute_payment_request(payment_id)
+        return _execute_payment_request(payment_id, principal)
 
     @app.post("/payments/{payment_id}/execute", response_model=ExecutePaymentResponse)
-    def execute_payment(payment_id: str) -> ExecutePaymentResponse:
-        return _execute_payment_request(payment_id)
+    def execute_payment(
+        payment_id: str, principal: Principal | None = Depends(_principal)
+    ) -> ExecutePaymentResponse:
+        return _execute_payment_request(payment_id, principal)
 
     @app.get("/audit")
-    def audit() -> dict[str, Any]:
+    def audit(principal: Principal | None = Depends(_principal)) -> dict[str, Any]:
         db = _open_db()
         try:
             audit_log = SQLiteAuditLog(db)
             valid, message = audit_log.verify_chain()
+            visible_events = [
+                event
+                for event in audit_log.events
+                if principal is None
+                or (
+                    isinstance(event.data, dict)
+                    and event.data.get("principal_id") == principal.principal_id
+                    and event.data.get("account_id") == principal.account_id
+                )
+            ]
             return {
                 "valid": valid,
                 "message": message,
-                "count": len(audit_log.events),
-                "events": [event.model_dump(mode="json") for event in audit_log.events],
+                "count": len(visible_events),
+                "events": [event.model_dump(mode="json") for event in visible_events],
             }
         finally:
             db.close()

@@ -58,6 +58,9 @@ class DBPaymentMandate(Base):
     status = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False)
     system_signature = Column(String, nullable=False)
+    system_key_id = Column(String, nullable=True, index=True)
+    principal_id = Column(String, nullable=True, index=True)
+    account_id = Column(String, nullable=True, index=True)
     
     # Razorpay integration
     razorpay_order_id = Column(String, nullable=True, unique=True, index=True)
@@ -87,6 +90,8 @@ class DBAuthorizationDecision(Base):
     user_public_key = Column(String, nullable=True)
     intent_hash = Column(String, nullable=True)
     cart_hash = Column(String, nullable=True)
+    principal_id = Column(String, nullable=True, index=True)
+    account_id = Column(String, nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
@@ -107,6 +112,19 @@ class DBApprovalRequest(Base):
     decision_signature = Column(String, nullable=True)
     continuation_payment_id = Column(String, nullable=True, unique=True, index=True)
     continuation_completed_at = Column(DateTime(timezone=True), nullable=True)
+    principal_id = Column(String, nullable=True, index=True)
+    account_id = Column(String, nullable=True, index=True)
+    approver_id = Column(String, nullable=True, index=True)
+
+
+class DBSystemKey(Base):
+    __tablename__ = "system_keys"
+
+    key_id = Column(String, primary_key=True)
+    public_key = Column(String, nullable=False)
+    state = Column(String, nullable=False, default="ACTIVE")
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    retired_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class DBAuditEvent(Base):

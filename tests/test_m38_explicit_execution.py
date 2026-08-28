@@ -173,7 +173,8 @@ def test_execution_survives_true_process_restart(tmp_path, monkeypatch) -> None:
         "merchant_allowlist=['Amazon'], blocked_categories=['Weapons'], "
         "velocity_limit=50, velocity_window_seconds=3600, "
         "require_approval_above_minor=900000)\n"
-        "r=TestClient(create_app(database_url=sys.argv[1], policy=p)).post("
+        "r=TestClient(create_app(database_url=sys.argv[1], policy=p), "
+        "headers={'Authorization':'Bearer test-token'}).post("
         "f'/payment-mandates/{sys.argv[2]}/execute')\n"
         "print(json.dumps({'status': r.status_code, 'body': r.json()}))\n"
     )

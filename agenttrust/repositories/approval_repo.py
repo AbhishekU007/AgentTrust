@@ -38,6 +38,7 @@ class SQLiteApprovalRepository:
                 decided_by=approval.decided_by,
                 approver_public_key=approval.approver_public_key,
                 decision_signature=approval.decision_signature,
+                approver_id=approval.decided_by,
             )
         )
         if commit and not self.db.info.get("coordinated_transaction"):
@@ -78,6 +79,7 @@ class SQLiteApprovalRepository:
                 decided_by=approval.decided_by,
                 approver_public_key=approval.approver_public_key,
                 decision_signature=approval.decision_signature,
+                approver_id=approval.decided_by,
             )
         )
         result = self.db.execute(statement)
@@ -135,4 +137,5 @@ class SQLiteApprovalRepository:
             decided_by=record.decided_by,
             approver_public_key=record.approver_public_key,
             decision_signature=record.decision_signature,
+            approver_id=record.approver_id,
         )

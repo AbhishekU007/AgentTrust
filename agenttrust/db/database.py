@@ -39,20 +39,41 @@ def init_db(local_engine=None) -> None:
     from agenttrust.db import schema  # noqa: F401
 
     target_engine = local_engine or engine
+    existing_tables = inspect(target_engine).get_table_names()
+    had_existing_tables = bool(existing_tables)
+    had_schema_version = False
+    if "schema_metadata" in existing_tables:
+        with target_engine.connect() as connection:
+            had_schema_version = (
+                connection.execute(
+                    text(
+                        "SELECT 1 FROM schema_metadata WHERE key='schema_version' "
+                        "LIMIT 1"
+                    )
+                ).first()
+                is not None
+            )
     Base.metadata.create_all(bind=target_engine)
+    version = "3.7" if had_existing_tables and not had_schema_version else "3.9"
     with target_engine.begin() as connection:
-        connection.execute(
-            text(
-                "INSERT OR IGNORE INTO schema_metadata (key, value) "
-                "VALUES ('schema_version', '3.7')"
+        existing_version = connection.execute(
+            text("SELECT value FROM schema_metadata WHERE key = 'schema_version' LIMIT 1")
+        ).scalar_one_or_none()
+        if existing_version is None:
+            connection.execute(
+                text(
+                    "INSERT OR IGNORE INTO schema_metadata (key, value) "
+                    "VALUES ('schema_version', :version)"
+                ),
+                {"version": version},
             )
-        )
-        connection.execute(
-            text(
-                "UPDATE schema_metadata SET value = '3.7', updated_at = CURRENT_TIMESTAMP "
-                "WHERE key = 'schema_version'"
+            connection.execute(
+                text(
+                    "UPDATE schema_metadata SET value = :version, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE key = 'schema_version'"
+                ),
+                {"version": version},
             )
-        )
     inspector = inspect(target_engine)
     if "approval_requests" in inspector.get_table_names():
         existing = {column["name"] for column in inspector.get_columns("approval_requests")}
@@ -113,9 +134,16 @@ def init_db(local_engine=None) -> None:
                     text("ALTER TABLE payment_mandates ADD COLUMN authorization_id VARCHAR")
                 )
             for column, definition in (
+                ("razorpay_order_id", "VARCHAR"),
+                ("payment_execution_status", "VARCHAR"),
+                ("payment_execution_error", "VARCHAR"),
                 ("payment_execution_error_code", "VARCHAR"),
                 ("payment_execution_id", "VARCHAR"),
                 ("payment_execution_started_at", "DATETIME"),
+                ("payment_executed_at", "DATETIME"),
+                ("system_key_id", "VARCHAR"),
+                ("principal_id", "VARCHAR"),
+                ("account_id", "VARCHAR"),
             ):
                 if column not in existing:
                     connection.execute(
@@ -123,6 +151,18 @@ def init_db(local_engine=None) -> None:
                             f"ALTER TABLE payment_mandates ADD COLUMN {column} {definition}"
                         )
                     )
+    for table, columns in {
+        "authorization_decisions": ("principal_id", "account_id"),
+        "approval_requests": ("principal_id", "account_id", "approver_id"),
+    }.items():
+        if table in inspector.get_table_names():
+            existing = {column["name"] for column in inspector.get_columns(table)}
+            with target_engine.begin() as connection:
+                for column in columns:
+                    if column not in existing:
+                        connection.execute(
+                            text(f"ALTER TABLE {table} ADD COLUMN {column} VARCHAR")
+                        )
 
 def get_db():
     """FastAPI dependency for database sessions."""
