@@ -32,7 +32,11 @@ class SQLiteTransactionRepository(ITransactionRepository):
     
     def mark_intent_consumed(self, intent_id: str) -> None:
         try:
-            self.db.add(DBConsumedIntent(intent_id=intent_id))
-            self.db.commit()
+            with self.db.begin_nested():
+                self.db.add(DBConsumedIntent(intent_id=intent_id))
+                self.db.flush()
+            if not self.db.info.get("coordinated_transaction"):
+                self.db.commit()
         except IntegrityError:
-            self.db.rollback()
+            if not self.db.info.get("coordinated_transaction"):
+                self.db.rollback()

@@ -15,10 +15,14 @@ class SQLiteReplayRegistry(IReplayRegistry):
         Uses DB unique constraints to definitively prevent replay.
         """
         try:
-            record = DBConsumedNonce(mandate_type=mandate_type, nonce=nonce)
-            self.db.add(record)
-            self.db.commit()
+            with self.db.begin_nested():
+                record = DBConsumedNonce(mandate_type=mandate_type, nonce=nonce)
+                self.db.add(record)
+                self.db.flush()
+            if not self.db.info.get("coordinated_transaction"):
+                self.db.commit()
             return True
         except IntegrityError:
-            self.db.rollback()
+            if not self.db.info.get("coordinated_transaction"):
+                self.db.rollback()
             return False
