@@ -16,11 +16,11 @@ from typing import Any
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from agenttrust.crypto import generate_keypair
+from agenttrust.crypto import generate_keypair, verify_signature
 from agenttrust.db.database import build_session_factory, init_db
 from agenttrust.db.schema import (
     DBAuthorizationDecision,
@@ -30,6 +30,10 @@ from agenttrust.db.schema import (
 )
 from agenttrust.engine import AuthorizationEngine
 from agenttrust.models import (
+    ApprovalDecision,
+    ApprovalRequest,
+    ApprovalStatus,
+    ApprovalTransitionError,
     AuthorizationResult,
     AuthorizationStatus,
     CartMandate,
@@ -39,6 +43,7 @@ from agenttrust.models import (
 )
 from agenttrust.payments.razorpay_adapter import PaymentExecutionResult, RazorpayAdapter
 from agenttrust.repositories.audit_repo import SQLiteAuditLog
+from agenttrust.repositories.approval_repo import SQLiteApprovalRepository
 from agenttrust.repositories.replay_repo import SQLiteReplayRegistry
 from agenttrust.repositories.transaction_repo import SQLiteTransactionRepository
 
@@ -57,6 +62,15 @@ class AuthorizeRequest(BaseModel):
 class ErrorResponse(BaseModel):
     code: str
     message: str
+
+
+class ApprovalDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decided_by: str = Field(..., min_length=1)
+    decided_at: datetime
+    approver_public_key: str = Field(..., min_length=1)
+    signature: str = Field(..., min_length=1)
 
 
 @dataclass
@@ -324,6 +338,161 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
             "service": "agenttrust",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
+    def _load_approval(db: Session, approval_id: str) -> ApprovalRequest:
+        approval = SQLiteApprovalRepository(db).get(approval_id)
+        if approval is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ErrorResponse(
+                    code="approval_not_found",
+                    message="Approval request not found",
+                ).model_dump(),
+            )
+        return approval
+
+    def _decide_approval(
+        approval_id: str,
+        payload: ApprovalDecisionRequest,
+        decision: ApprovalStatus,
+    ) -> ApprovalRequest:
+        db = _open_db()
+        try:
+            approval = _load_approval(db, approval_id)
+            now = payload.decided_at
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=timezone.utc)
+            else:
+                now = now.astimezone(timezone.utc)
+            expected_decision = (
+                ApprovalStatus.APPROVED
+                if decision is ApprovalStatus.APPROVED
+                else ApprovalStatus.REJECTED
+            )
+            decision_payload = ApprovalDecision(
+                approval_id=approval.approval_id,
+                authorization_id=approval.authorization_id,
+                intent_id=approval.intent_id,
+                cart_id=approval.cart_id,
+                decision=expected_decision,
+                decided_at=now,
+                approver_id=payload.decided_by,
+                approver_public_key=payload.approver_public_key,
+            )
+            try:
+                signature = _load_signature(payload.signature)
+                public_key = _load_user_public_key(payload.approver_public_key)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=ErrorResponse(
+                        code="invalid_approval_signature",
+                        message=str(exc),
+                    ).model_dump(),
+                ) from exc
+            if not verify_signature(decision_payload.canonical_bytes(), signature, public_key):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=ErrorResponse(
+                        code="invalid_approval_signature",
+                        message="Approval signature verification failed",
+                    ).model_dump(),
+                )
+            try:
+                if decision is ApprovalStatus.APPROVED:
+                    approval.approve(now, payload.decided_by)
+                    event_type = "APPROVAL_APPROVED"
+                else:
+                    approval.reject(now, payload.decided_by)
+                    event_type = "APPROVAL_REJECTED"
+            except ApprovalTransitionError as exc:
+                if approval.status is ApprovalStatus.EXPIRED and approval.decided_by == "system":
+                    try:
+                        SQLiteApprovalRepository(db).save_transition(
+                            approval, ApprovalStatus.PENDING
+                        )
+                    except ApprovalTransitionError:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=ErrorResponse(
+                                code="approval_transition_not_allowed",
+                                message="Approval was already decided by another request",
+                            ).model_dump(),
+                        ) from exc
+                    SQLiteAuditLog(db).record(
+                        event_type="APPROVAL_EXPIRED",
+                        actor="system",
+                        intent_id=approval.intent_id,
+                        cart_id=approval.cart_id,
+                        reason="Approval expired before a decision was made",
+                        data={"approval_id": approval.approval_id},
+                    )
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=ErrorResponse(
+                        code="approval_transition_not_allowed",
+                        message=str(exc),
+                    ).model_dump(),
+                ) from exc
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=ErrorResponse(
+                        code="invalid_approval_decision",
+                        message=str(exc),
+                    ).model_dump(),
+                ) from exc
+
+            try:
+                approval.approver_public_key = payload.approver_public_key
+                approval.decision_signature = payload.signature
+                SQLiteApprovalRepository(db).save_transition(
+                    approval, ApprovalStatus.PENDING
+                )
+            except ApprovalTransitionError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=ErrorResponse(
+                        code="approval_transition_not_allowed",
+                        message=str(exc),
+                    ).model_dump(),
+                ) from exc
+            SQLiteAuditLog(db).record(
+                event_type=event_type,
+                actor=payload.decided_by,
+                intent_id=approval.intent_id,
+                cart_id=approval.cart_id,
+                reason=approval.reason,
+                data={
+                    "approval_id": approval.approval_id,
+                    "approver_id": approval.decided_by,
+                    "approver_public_key": approval.approver_public_key,
+                    "decision_signature": approval.decision_signature,
+                },
+            )
+            return approval
+        finally:
+            db.close()
+
+    @app.get("/approvals/{approval_id}", response_model=ApprovalRequest)
+    def get_approval(approval_id: str) -> ApprovalRequest:
+        db = _open_db()
+        try:
+            return _load_approval(db, approval_id)
+        finally:
+            db.close()
+
+    @app.post("/approvals/{approval_id}/approve", response_model=ApprovalRequest)
+    def approve_approval(
+        approval_id: str, payload: ApprovalDecisionRequest
+    ) -> ApprovalRequest:
+        return _decide_approval(approval_id, payload, ApprovalStatus.APPROVED)
+
+    @app.post("/approvals/{approval_id}/reject", response_model=ApprovalRequest)
+    def reject_approval(
+        approval_id: str, payload: ApprovalDecisionRequest
+    ) -> ApprovalRequest:
+        return _decide_approval(approval_id, payload, ApprovalStatus.REJECTED)
 
     @app.post("/authorize")
     def authorize(payload: AuthorizeRequest, execute: bool = True) -> dict[str, Any]:

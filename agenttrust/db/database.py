@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 import os
 
@@ -36,6 +36,18 @@ def init_db(local_engine=None) -> None:
 
     target_engine = local_engine or engine
     Base.metadata.create_all(bind=target_engine)
+    inspector = inspect(target_engine)
+    if "approval_requests" in inspector.get_table_names():
+        existing = {column["name"] for column in inspector.get_columns("approval_requests")}
+        with target_engine.begin() as connection:
+            if "approver_public_key" not in existing:
+                connection.execute(
+                    text("ALTER TABLE approval_requests ADD COLUMN approver_public_key VARCHAR")
+                )
+            if "decision_signature" not in existing:
+                connection.execute(
+                    text("ALTER TABLE approval_requests ADD COLUMN decision_signature VARCHAR")
+                )
 
 def get_db():
     """FastAPI dependency for database sessions."""

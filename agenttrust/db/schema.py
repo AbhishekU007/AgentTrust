@@ -72,6 +72,23 @@ class DBAuthorizationDecision(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class DBApprovalRequest(Base):
+    __tablename__ = "approval_requests"
+
+    approval_id = Column(String, primary_key=True, index=True)
+    authorization_id = Column(String, nullable=False, index=True)
+    intent_id = Column(String, nullable=False, index=True)
+    cart_id = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False, index=True)
+    reason = Column(String, nullable=False)
+    requested_at = Column(DateTime(timezone=True), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    decided_at = Column(DateTime(timezone=True), nullable=True)
+    decided_by = Column(String, nullable=True)
+    approver_public_key = Column(String, nullable=True)
+    decision_signature = Column(String, nullable=True)
+
+
 class DBAuditEvent(Base):
     __tablename__ = "audit_events"
 

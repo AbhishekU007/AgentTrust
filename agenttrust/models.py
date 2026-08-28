@@ -17,7 +17,7 @@ from typing import Any, Optional
 import hashlib
 import uuid
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +30,43 @@ class AuthorizationStatus(str, Enum):
     ALLOW = "ALLOW"
     BLOCK = "BLOCK"
     REQUIRE_APPROVAL = "REQUIRE_APPROVAL"
+
+
+class ApprovalStatus(str, Enum):
+    """Lifecycle states for a human approval request."""
+
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
+
+
+class ApprovalTransitionError(ValueError):
+    """Raised when an approval lifecycle transition is not permitted."""
+
+
+class ApprovalDecision(BaseModel):
+    """Canonical payload signed by an external approval authority."""
+
+    version: str = "1"
+    domain: str = "agenttrust.approval-decision"
+    approval_id: str = Field(..., min_length=1)
+    authorization_id: str = Field(..., min_length=1)
+    intent_id: str = Field(..., min_length=1)
+    cart_id: str = Field(..., min_length=1)
+    decision: ApprovalStatus
+    decided_at: datetime
+    approver_id: str = Field(..., min_length=1)
+    approver_public_key: str = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> "ApprovalDecision":
+        if self.decision not in {ApprovalStatus.APPROVED, ApprovalStatus.REJECTED}:
+            raise ValueError("approval decisions must be APPROVED or REJECTED")
+        return self
+
+    def canonical_bytes(self) -> bytes:
+        return compute_canonical_bytes(self.model_dump())
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +240,76 @@ class AuthorizationResult(BaseModel):
     payment_mandate: Optional[PaymentMandate] = None
 
 
+class ApprovalRequest(BaseModel):
+    """A human approval request bound to one authorization context."""
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    approval_id: str = Field(..., min_length=1)
+    authorization_id: str = Field(..., min_length=1)
+    intent_id: str = Field(..., min_length=1)
+    cart_id: str = Field(..., min_length=1)
+    status: ApprovalStatus = ApprovalStatus.PENDING
+    reason: str = Field(..., min_length=1)
+    requested_at: datetime
+    expires_at: datetime
+    decided_at: Optional[datetime] = None
+    decided_by: Optional[str] = None
+    approver_public_key: Optional[str] = None
+    decision_signature: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_times_and_decision(self) -> "ApprovalRequest":
+        if self.expires_at <= self.requested_at:
+            raise ValueError("expires_at must be after requested_at")
+
+        is_pending = self.status == ApprovalStatus.PENDING
+        if is_pending and (self.decided_at is not None or self.decided_by is not None):
+            raise ValueError("pending approvals cannot have a decision")
+        if not is_pending and (self.decided_at is None or not self.decided_by):
+            raise ValueError("terminal approvals require decided_at and decided_by")
+        return self
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in {"approval_id", "authorization_id", "intent_id", "cart_id"} and name in self.__dict__:
+            if self.__dict__[name] != value:
+                raise ValueError(f"{name} cannot be changed after creation")
+        super().__setattr__(name, value)
+
+    def _transition(self, target: ApprovalStatus, now: datetime, decided_by: str) -> "ApprovalRequest":
+        if self.status != ApprovalStatus.PENDING:
+            raise ApprovalTransitionError(
+                f"Cannot transition approval from {self.status.value} to {target.value}"
+            )
+        if now >= self.expires_at and target != ApprovalStatus.EXPIRED:
+            self.expire(now)
+            raise ApprovalTransitionError("Cannot decide an expired approval")
+        if not decided_by or not decided_by.strip():
+            raise ValueError("decided_by must be a non-empty string")
+        object.__setattr__(self, "status", target)
+        object.__setattr__(self, "decided_at", now)
+        object.__setattr__(self, "decided_by", decided_by)
+        return self
+
+    def approve(self, now: datetime, decided_by: str) -> "ApprovalRequest":
+        return self._transition(ApprovalStatus.APPROVED, now, decided_by)
+
+    def reject(self, now: datetime, decided_by: str) -> "ApprovalRequest":
+        return self._transition(ApprovalStatus.REJECTED, now, decided_by)
+
+    def expire(self, now: datetime) -> "ApprovalRequest":
+        if self.status != ApprovalStatus.PENDING:
+            raise ApprovalTransitionError(
+                f"Cannot transition approval from {self.status.value} to {ApprovalStatus.EXPIRED.value}"
+            )
+        if now < self.expires_at:
+            raise ApprovalTransitionError("Cannot expire an approval before its expiry")
+        object.__setattr__(self, "status", ApprovalStatus.EXPIRED)
+        object.__setattr__(self, "decided_at", now)
+        object.__setattr__(self, "decided_by", "system")
+        return self
+
+
 # ---------------------------------------------------------------------------
 # Audit
 # ---------------------------------------------------------------------------
@@ -225,4 +332,3 @@ class AuditEvent(BaseModel):
     def canonical_bytes(self) -> bytes:
         """Deterministic bytes for hashing (excludes event_hash)."""
         return compute_canonical_bytes(self.model_dump(exclude={"event_hash"}))
-
