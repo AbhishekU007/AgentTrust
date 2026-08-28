@@ -112,6 +112,17 @@ def init_db(local_engine=None) -> None:
                 connection.execute(
                     text("ALTER TABLE payment_mandates ADD COLUMN authorization_id VARCHAR")
                 )
+            for column, definition in (
+                ("payment_execution_error_code", "VARCHAR"),
+                ("payment_execution_id", "VARCHAR"),
+                ("payment_execution_started_at", "DATETIME"),
+            ):
+                if column not in existing:
+                    connection.execute(
+                        text(
+                            f"ALTER TABLE payment_mandates ADD COLUMN {column} {definition}"
+                        )
+                    )
 
 def get_db():
     """FastAPI dependency for database sessions."""

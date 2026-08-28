@@ -10,14 +10,18 @@ import base64
 import binascii
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import os
 import uuid
 from typing import Any
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from fastapi import Body, FastAPI, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import text
+from sqlalchemy import text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -25,6 +29,7 @@ from agenttrust.crypto import generate_keypair, verify_signature
 from agenttrust.db.database import build_session_factory, init_db
 from agenttrust.db.schema import (
     DBAuthorizationDecision,
+    DBApprovalRequest,
     DBCartMandate,
     DBIntentMandate,
     DBPaymentMandate,
@@ -83,6 +88,10 @@ class EmptyContinuationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ExecutePaymentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 @dataclass
 class ParsedCryptoMaterial:
     signature: bytes
@@ -102,6 +111,32 @@ class ExecutePaymentResponse(BaseModel):
     payment_execution_status: str
     razorpay_order_id: str | None
     result: PaymentExecutionResponse
+
+
+_PROCESS_SYSTEM_PRIVATE_KEY = None
+_PROCESS_SYSTEM_PUBLIC_KEY = None
+_PROCESS_SYSTEM_KEY_MATERIAL = None
+
+
+def _system_keypair():
+    global _PROCESS_SYSTEM_PRIVATE_KEY, _PROCESS_SYSTEM_PUBLIC_KEY
+    global _PROCESS_SYSTEM_KEY_MATERIAL
+    configured = os.getenv("AGENTTRUST_SYSTEM_PRIVATE_KEY")
+    if configured:
+        if _PROCESS_SYSTEM_KEY_MATERIAL != configured:
+            try:
+                raw = bytes.fromhex(configured)
+                if len(raw) != 32:
+                    raise ValueError("system key must contain 32 bytes")
+                _PROCESS_SYSTEM_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(raw)
+                _PROCESS_SYSTEM_PUBLIC_KEY = _PROCESS_SYSTEM_PRIVATE_KEY.public_key()
+            except (ValueError, TypeError) as exc:
+                raise RuntimeError("AGENTTRUST_SYSTEM_PRIVATE_KEY is invalid") from exc
+            _PROCESS_SYSTEM_KEY_MATERIAL = configured
+    elif _PROCESS_SYSTEM_PRIVATE_KEY is None or _PROCESS_SYSTEM_PUBLIC_KEY is None:
+        _PROCESS_SYSTEM_PRIVATE_KEY, _PROCESS_SYSTEM_PUBLIC_KEY = generate_keypair()
+        _PROCESS_SYSTEM_KEY_MATERIAL = None
+    return _PROCESS_SYSTEM_PRIVATE_KEY, _PROCESS_SYSTEM_PUBLIC_KEY
 
 
 def _load_user_public_key(value: str) -> Ed25519PublicKey:
@@ -334,10 +369,12 @@ def _record_payment_execution(
         db_payment.razorpay_order_id = execution.order_id
         db_payment.payment_execution_status = "SUCCEEDED"
         db_payment.payment_execution_error = None
+        db_payment.payment_execution_error_code = None
         db_payment.payment_executed_at = datetime.now(timezone.utc)
     else:
         db_payment.payment_execution_status = "FAILED"
         db_payment.payment_execution_error = execution.message
+        db_payment.payment_execution_error_code = execution.error_code
 
 
 def _execute_payment_with_adapter(
@@ -351,11 +388,234 @@ def _execute_payment_with_adapter(
     return execution
 
 
+def _claim_payment_execution(db: Session, db_payment: DBPaymentMandate) -> tuple[str | None, bool]:
+    """Claim a mandate once, returning an existing order without provider access."""
+    if db_payment.payment_execution_status == "SUCCEEDED":
+        return db_payment.razorpay_order_id, False
+    if db_payment.payment_execution_status == "EXECUTING":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=ErrorResponse(
+                code="payment_execution_in_progress",
+                message="Payment mandate execution is already in progress",
+            ).model_dump(),
+        )
+
+    execution_id = uuid.uuid4().hex
+    statement = (
+        update(DBPaymentMandate)
+        .where(
+            DBPaymentMandate.payment_id == db_payment.payment_id,
+            DBPaymentMandate.payment_execution_status.in_(
+                ("NOT_EXECUTED", "READY", "FAILED")
+            ),
+        )
+        .values(
+            payment_execution_status="EXECUTING",
+            payment_execution_id=execution_id,
+            payment_execution_started_at=datetime.now(timezone.utc),
+            payment_execution_error=None,
+            payment_execution_error_code=None,
+        )
+    )
+    result = db.execute(statement)
+    if result.rowcount != 1:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=ErrorResponse(
+                code="payment_execution_in_progress",
+                message="Payment mandate execution was claimed concurrently",
+            ).model_dump(),
+        )
+    db.commit()
+    db.refresh(db_payment)
+    return execution_id, True
+
+
+def _validate_payment_for_execution(
+    db: Session,
+    record: DBPaymentMandate,
+    policy: PolicyConfig,
+    system_public_key,
+) -> PaymentMandate:
+    """Reconstruct and validate all persisted payment security context."""
+    if record.status != AuthorizationStatus.ALLOW.value:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=ErrorResponse(
+                code="payment_mandate_not_executable",
+                message="Only an authorized payment mandate can execute",
+            ).model_dump(),
+        )
+    decision_query = db.query(DBAuthorizationDecision)
+    if record.authorization_id:
+        decision = decision_query.filter(
+            DBAuthorizationDecision.decision_id == record.authorization_id
+        ).one_or_none()
+    else:
+        decision = decision_query.filter(
+            DBAuthorizationDecision.payment_id == record.payment_id
+        ).one_or_none()
+    if decision is None or (
+        record.approval_id is None
+        and decision.payment_id not in {None, record.payment_id}
+    ) or (
+        record.approval_id is None
+        and decision.status != AuthorizationStatus.ALLOW.value
+    ) or (
+        record.approval_id is not None
+        and decision.status != AuthorizationStatus.REQUIRE_APPROVAL.value
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=ErrorResponse(
+                code="payment_mandate_invalid",
+                message="Payment mandate authorization linkage is invalid",
+            ).model_dump(),
+        )
+    intent_record = db.get(DBIntentMandate, record.intent_id)
+    cart_record = db.get(DBCartMandate, record.cart_id)
+    if intent_record is None or cart_record is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=ErrorResponse(
+                code="payment_mandate_invalid",
+                message="Payment mandate context is missing",
+            ).model_dump(),
+        )
+    intent = IntentMandate(
+        intent_id=intent_record.intent_id,
+        description=intent_record.description,
+        max_amount_minor=intent_record.max_amount_minor,
+        currency=intent_record.currency,
+        allowed_merchants=intent_record.allowed_merchants,
+        allowed_categories=intent_record.allowed_categories,
+        nonce=intent_record.nonce,
+        created_at=intent_record.created_at,
+        expires_at=intent_record.expires_at,
+    )
+    cart = CartMandate(
+        cart_id=cart_record.cart_id,
+        intent_id=cart_record.intent_id,
+        merchant=cart_record.merchant,
+        category=cart_record.category,
+        items=cart_record.items,
+        total_amount_minor=cart_record.total_amount_minor,
+        currency=cart_record.currency,
+        nonce=cart_record.nonce,
+        created_at=cart_record.created_at,
+    )
+    if (
+        intent.compute_hash() != record.intent_hash
+        or cart.compute_hash() != record.cart_hash
+        or decision.intent_hash != record.intent_hash
+        or decision.cart_hash != record.cart_hash
+        or intent.intent_id != record.intent_id
+        or cart.cart_id != record.cart_id
+        or record.amount_minor != cart.total_amount_minor
+        or record.currency != cart.currency
+        or record.merchant != cart.merchant
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=ErrorResponse(
+                code="payment_mandate_invalid",
+                message="Payment mandate context or hashes are invalid",
+            ).model_dump(),
+        )
+    payment = _payment_from_db(record)
+    try:
+        valid_signature = verify_signature(
+            payment.canonical_bytes(),
+            bytes.fromhex(record.system_signature),
+            system_public_key,
+        )
+    except (ValueError, TypeError):
+        valid_signature = False
+    if not valid_signature:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=ErrorResponse(
+                code="payment_mandate_invalid",
+                message="Payment mandate system signature is invalid",
+            ).model_dump(),
+        )
+    from agenttrust.policy import evaluate_policy
+    evaluated = evaluate_policy(
+        intent,
+        cart,
+        policy,
+        SQLiteTransactionRepository(db).count_recent_transactions(
+            policy.velocity_window_seconds
+        ),
+    )
+    if evaluated.status is AuthorizationStatus.BLOCK:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=ErrorResponse(
+                code="payment_execution_rejected",
+                message="Current policy does not permit payment execution",
+            ).model_dump(),
+        )
+    if record.approval_id is not None:
+        approval = db.get(DBApprovalRequest, record.approval_id)
+        if (
+            approval is None
+            or approval.status != ApprovalStatus.APPROVED.value
+            or approval.authorization_id != record.authorization_id
+            or approval.intent_id != record.intent_id
+            or approval.cart_id != record.cart_id
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=ErrorResponse(
+                    code="payment_execution_rejected",
+                    message="Approved payment mandate linkage is invalid",
+                ).model_dump(),
+            )
+        if approval.expires_at <= datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=ErrorResponse(
+                    code="payment_execution_rejected",
+                    message="Approval has expired",
+                ).model_dump(),
+            )
+        try:
+            approval_payload = ApprovalDecision(
+                approval_id=approval.approval_id,
+                authorization_id=approval.authorization_id,
+                intent_id=approval.intent_id,
+                cart_id=approval.cart_id,
+                decision=ApprovalStatus.APPROVED,
+                decided_at=approval.decided_at,
+                approver_id=approval.decided_by,
+                approver_public_key=approval.approver_public_key,
+            )
+            approval_valid = verify_signature(
+                approval_payload.canonical_bytes(),
+                _load_signature(approval.decision_signature or ""),
+                _load_user_public_key(approval.approver_public_key or ""),
+            )
+        except (ValueError, TypeError, HTTPException):
+            approval_valid = False
+        if not approval_valid:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=ErrorResponse(
+                    code="payment_execution_rejected",
+                    message="Approval signature is invalid",
+                ).model_dump(),
+            )
+    return payment
+
+
 def create_app(database_url: str | None = None, policy: PolicyConfig | None = None) -> FastAPI:
     app = FastAPI(title="AgentTrust API", version="0.2.0")
     resolved_policy = policy or _default_policy()
     session_factory, local_engine = build_session_factory(database_url)
-    system_private_key, system_public_key = generate_keypair()
+    system_private_key, system_public_key = _system_keypair()
 
     app.state.policy = resolved_policy
     app.state.session_factory = session_factory
@@ -692,6 +952,8 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                 intent_hash=payload.intent.compute_hash(),
                 cart_hash=payload.cart.compute_hash(),
             )
+            if db_payment is not None:
+                db_payment.authorization_id = decision_id
             response = result.model_dump(mode="json")
             if result.status is AuthorizationStatus.REQUIRE_APPROVAL:
                 approval = _approval_for_authorization(
@@ -730,8 +992,7 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
         finally:
             db.close()
 
-    @app.post("/payments/{payment_id}/execute", response_model=ExecutePaymentResponse)
-    def execute_payment(payment_id: str) -> ExecutePaymentResponse:
+    def _execute_payment_request(payment_id: str) -> ExecutePaymentResponse:
         db = _open_db()
         try:
             db_payment = db.get(DBPaymentMandate, payment_id)
@@ -744,26 +1005,79 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                     ).model_dump(),
                 )
 
-            payment_mandate = _payment_from_db(db_payment)
-            execution = _execute_payment_with_adapter(db, payment_mandate, db_payment)
-
-            audit = SQLiteAuditLog(db)
-            event_type = "PAYMENT_EXECUTION_SUCCESS" if execution.success else "PAYMENT_EXECUTION_FAILED"
-            audit.record(
-                event_type=event_type,
-                actor="system",
-                intent_id=db_payment.intent_id,
-                cart_id=db_payment.cart_id,
-                decision=AuthorizationStatus.ALLOW,
-                reason=execution.message,
-                data={
-                    "payment_id": db_payment.payment_id,
-                    "order_id": execution.order_id,
-                    "is_mocked": execution.is_mocked,
-                    "error_code": execution.error_code,
-                },
+            payment_mandate = _validate_payment_for_execution(
+                db,
+                db_payment,
+                app.state.policy,
+                app.state.system_public_key,
             )
-            db.commit()
+            existing_order_id, claimed = _claim_payment_execution(db, db_payment)
+            if not claimed:
+                execution = PaymentExecutionResult(
+                    success=True,
+                    order_id=existing_order_id,
+                    message="Payment execution already completed",
+                    is_mocked=False,
+                )
+                SQLiteAuditLog(db).record(
+                    event_type="PAYMENT_EXECUTION_ALREADY_COMPLETED",
+                    actor="system",
+                    intent_id=db_payment.intent_id,
+                    cart_id=db_payment.cart_id,
+                    decision=AuthorizationStatus.ALLOW,
+                    reason=execution.message,
+                    data={"payment_id": payment_id, "order_id": existing_order_id},
+                )
+            else:
+                audit = SQLiteAuditLog(db)
+                audit.record(
+                    event_type="PAYMENT_EXECUTION_STARTED",
+                    actor="system",
+                    intent_id=db_payment.intent_id,
+                    cart_id=db_payment.cart_id,
+                    decision=AuthorizationStatus.ALLOW,
+                    reason="Explicit payment execution claimed",
+                    data={
+                        "payment_id": payment_id,
+                        "execution_id": db_payment.payment_execution_id,
+                    },
+                )
+                try:
+                    execution = _execute_payment_with_adapter(
+                        db, payment_mandate, db_payment
+                    )
+                except Exception as exc:
+                    db.rollback()
+                    db_payment = db.get(DBPaymentMandate, payment_id)
+                    if db_payment is None:
+                        raise
+                    execution = PaymentExecutionResult(
+                        success=False,
+                        order_id=None,
+                        error_code="provider_execution_error",
+                        message="Payment provider execution failed",
+                        is_mocked=False,
+                    )
+                    _record_payment_execution(db_payment, execution)
+                SQLiteAuditLog(db).record(
+                    event_type=(
+                        "PAYMENT_EXECUTION_SUCCEEDED"
+                        if execution.success
+                        else "PAYMENT_EXECUTION_FAILED"
+                    ),
+                    actor="system",
+                    intent_id=db_payment.intent_id,
+                    cart_id=db_payment.cart_id,
+                    decision=AuthorizationStatus.ALLOW,
+                    reason=execution.message,
+                    data={
+                        "payment_id": payment_id,
+                        "order_id": execution.order_id,
+                        "is_mocked": execution.is_mocked,
+                        "error_code": execution.error_code,
+                    },
+                )
+                db.commit()
 
             return ExecutePaymentResponse(
                 payment_id=payment_id,
@@ -779,6 +1093,20 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
             )
         finally:
             db.close()
+
+    @app.post(
+        "/payment-mandates/{payment_id}/execute",
+        response_model=ExecutePaymentResponse,
+    )
+    def execute_payment_mandate(
+        payment_id: str,
+        payload: ExecutePaymentRequest | None = Body(default=None),
+    ) -> ExecutePaymentResponse:
+        return _execute_payment_request(payment_id)
+
+    @app.post("/payments/{payment_id}/execute", response_model=ExecutePaymentResponse)
+    def execute_payment(payment_id: str) -> ExecutePaymentResponse:
+        return _execute_payment_request(payment_id)
 
     @app.get("/audit")
     def audit() -> dict[str, Any]:
