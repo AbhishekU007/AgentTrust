@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 
 from agenttrust.crypto import sign_mandate, verify_signature
 from agenttrust.db.schema import (
@@ -32,7 +33,9 @@ from agenttrust.models import (
 )
 from agenttrust.policy import evaluate_policy
 from agenttrust.repositories.approval_repo import SQLiteApprovalRepository
+from agenttrust.repositories.audit_repo import SQLiteAuditLog
 from agenttrust.repositories.transaction_repo import SQLiteTransactionRepository
+from agenttrust.db.unit_of_work import DatabaseUnitOfWork
 from agenttrust.verification import verify_intent_cart_consistency
 
 
@@ -255,9 +258,16 @@ class ApprovalContinuationService:
         payment.system_signature = sign_mandate(
             payment.canonical_bytes(), self.system_private_key
         ).hex()
-        reserved = SQLiteApprovalRepository(self.db).reserve_continuation(
-            approval_id, payment.payment_id, now
-        )
+        try:
+            reserved = SQLiteApprovalRepository(self.db).reserve_continuation(
+                approval_id, payment.payment_id, now, commit=False
+            )
+        except SQLAlchemyError as exc:
+            self.db.rollback()
+            raise ApprovalContinuationError(
+                "continuation_transaction_failed",
+                "Continuation transaction could not be started",
+            ) from exc
         if not reserved:
             existing = self.db.get(DBApprovalRequest, approval_id)
             if existing and existing.continuation_payment_id:
@@ -271,25 +281,72 @@ class ApprovalContinuationService:
                     return self._payment_from_db(payment_record), True, approval.authorization_id
             _reject("continuation_race", "Approval continuation was claimed concurrently")
 
-        self.db.add(
-            DBPaymentMandate(
-                payment_id=payment.payment_id,
-                intent_id=payment.intent_id,
-                intent_hash=payment.intent_hash,
-                cart_id=payment.cart_id,
-                cart_hash=payment.cart_hash,
-                amount_minor=payment.amount_minor,
-                currency=payment.currency,
-                merchant=payment.merchant,
-                status=payment.status.value,
-                created_at=payment.created_at,
-                system_signature=payment.system_signature,
-                payment_execution_status="NOT_EXECUTED",
-                approval_id=approval_id,
-                authorization_id=approval.authorization_id,
-            )
-        )
-        self.db.commit()
+        try:
+            with DatabaseUnitOfWork(self.db):
+                self.db.add(
+                    DBPaymentMandate(
+                        payment_id=payment.payment_id,
+                        intent_id=payment.intent_id,
+                        intent_hash=payment.intent_hash,
+                        cart_id=payment.cart_id,
+                        cart_hash=payment.cart_hash,
+                        amount_minor=payment.amount_minor,
+                        currency=payment.currency,
+                        merchant=payment.merchant,
+                        status=payment.status.value,
+                        created_at=payment.created_at,
+                        system_signature=payment.system_signature,
+                        payment_execution_status="NOT_EXECUTED",
+                        approval_id=approval_id,
+                        authorization_id=approval.authorization_id,
+                    )
+                )
+                audit = SQLiteAuditLog(self.db)
+                audit.record(
+                    event_type="APPROVAL_CONTINUATION_STARTED",
+                    actor="system",
+                    intent_id=payment.intent_id,
+                    cart_id=payment.cart_id,
+                    reason="Approval continuation revalidated",
+                    data={
+                        "approval_id": approval_id,
+                        "authorization_id": approval.authorization_id,
+                    },
+                    commit=False,
+                )
+                audit.record(
+                    event_type="AUTHORIZATION_RESUMED",
+                    actor="system",
+                    intent_id=payment.intent_id,
+                    cart_id=payment.cart_id,
+                    decision="ALLOW",
+                    reason="Approved authorization resumed",
+                    data={
+                        "approval_id": approval_id,
+                        "authorization_id": approval.authorization_id,
+                    },
+                    commit=False,
+                )
+                audit.record(
+                    event_type="PAYMENT_MANDATE_CREATED_FROM_APPROVAL",
+                    actor="system",
+                    intent_id=payment.intent_id,
+                    cart_id=payment.cart_id,
+                    decision="ALLOW",
+                    reason="System-signed payment mandate created",
+                    data={
+                        "approval_id": approval_id,
+                        "authorization_id": approval.authorization_id,
+                        "payment_id": payment.payment_id,
+                    },
+                    commit=False,
+                )
+        except SQLAlchemyError as exc:
+            self.db.rollback()
+            raise ApprovalContinuationError(
+                "continuation_transaction_failed",
+                "Continuation transaction could not be committed",
+            ) from exc
         return payment, False, approval.authorization_id
 
     @staticmethod

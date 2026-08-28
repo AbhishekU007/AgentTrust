@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from fastapi import Body, FastAPI, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from agenttrust.crypto import generate_keypair, verify_signature
@@ -28,6 +29,7 @@ from agenttrust.db.schema import (
     DBIntentMandate,
     DBPaymentMandate,
 )
+from agenttrust.db.unit_of_work import DatabaseUnitOfWork
 from agenttrust.engine import AuthorizationEngine
 from agenttrust.models import (
     ApprovalDecision,
@@ -179,20 +181,27 @@ def _persist_intent(db: Session, intent: IntentMandate) -> None:
     if existing is not None:
         return
 
-    db.add(
-        DBIntentMandate(
-            intent_id=intent.intent_id,
-            description=intent.description,
-            max_amount_minor=intent.max_amount_minor,
-            currency=intent.currency,
-            allowed_merchants=intent.allowed_merchants,
-            allowed_categories=intent.allowed_categories,
-            nonce=intent.nonce,
-            created_at=intent.created_at,
-            expires_at=intent.expires_at,
-            canonical_bytes_hex=intent.canonical_bytes().hex(),
-        )
-    )
+    try:
+        with db.begin_nested():
+            db.add(
+                DBIntentMandate(
+                    intent_id=intent.intent_id,
+                    description=intent.description,
+                    max_amount_minor=intent.max_amount_minor,
+                    currency=intent.currency,
+                    allowed_merchants=intent.allowed_merchants,
+                    allowed_categories=intent.allowed_categories,
+                    nonce=intent.nonce,
+                    created_at=intent.created_at,
+                    expires_at=intent.expires_at,
+                    canonical_bytes_hex=intent.canonical_bytes().hex(),
+                )
+            )
+            db.flush()
+    except IntegrityError:
+        db.rollback()
+        if db.get(DBIntentMandate, intent.intent_id) is None:
+            raise
 
 
 def _persist_cart(db: Session, cart: CartMandate) -> None:
@@ -200,19 +209,26 @@ def _persist_cart(db: Session, cart: CartMandate) -> None:
     if existing is not None:
         return
 
-    db.add(
-        DBCartMandate(
-            cart_id=cart.cart_id,
-            intent_id=cart.intent_id,
-            merchant=cart.merchant,
-            category=cart.category,
-            items=[item.model_dump(mode="json") for item in cart.items],
-            total_amount_minor=cart.total_amount_minor,
-            currency=cart.currency,
-            nonce=cart.nonce,
-            created_at=cart.created_at,
-        )
-    )
+    try:
+        with db.begin_nested():
+            db.add(
+                DBCartMandate(
+                    cart_id=cart.cart_id,
+                    intent_id=cart.intent_id,
+                    merchant=cart.merchant,
+                    category=cart.category,
+                    items=[item.model_dump(mode="json") for item in cart.items],
+                    total_amount_minor=cart.total_amount_minor,
+                    currency=cart.currency,
+                    nonce=cart.nonce,
+                    created_at=cart.created_at,
+                )
+            )
+            db.flush()
+    except IntegrityError:
+        db.rollback()
+        if db.get(DBCartMandate, cart.cart_id) is None:
+            raise
 
 
 def _persist_payment_mandate(db: Session, payment: PaymentMandate) -> DBPaymentMandate:
@@ -601,43 +617,6 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                         "payment_id": payment.payment_id,
                     },
                 )
-            else:
-                audit.record(
-                    event_type="APPROVAL_CONTINUATION_STARTED",
-                    actor="system",
-                    intent_id=payment.intent_id,
-                    cart_id=payment.cart_id,
-                    reason="Approval continuation revalidated",
-                    data={
-                        "approval_id": approval_id,
-                        "authorization_id": authorization_id,
-                    },
-                )
-                audit.record(
-                    event_type="AUTHORIZATION_RESUMED",
-                    actor="system",
-                    intent_id=payment.intent_id,
-                    cart_id=payment.cart_id,
-                    decision=AuthorizationStatus.ALLOW,
-                    reason="Approved authorization resumed",
-                    data={
-                        "approval_id": approval_id,
-                        "authorization_id": authorization_id,
-                    },
-                )
-                audit.record(
-                    event_type="PAYMENT_MANDATE_CREATED_FROM_APPROVAL",
-                    actor="system",
-                    intent_id=payment.intent_id,
-                    cart_id=payment.cart_id,
-                    decision=AuthorizationStatus.ALLOW,
-                    reason="System-signed payment mandate created",
-                    data={
-                        "approval_id": approval_id,
-                        "authorization_id": authorization_id,
-                        "payment_id": payment.payment_id,
-                    },
-                )
             return {
                 "approval_id": approval_id,
                 "authorization_id": authorization_id,
@@ -660,21 +639,9 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
         parsed = _parse_crypto_material(payload)
         db = _open_db()
         try:
+            db.info["coordinated_transaction"] = True
             _persist_intent(db, payload.intent)
             _persist_cart(db, payload.cart)
-            try:
-                db.commit()
-            except Exception as exc:
-                # Handle race where concurrent insertion of the same intent/cart
-                # violates unique constraints. Roll back and continue — the
-                # existing records are acceptable for authorization processing.
-                from sqlalchemy.exc import IntegrityError
-
-                if isinstance(exc, IntegrityError):
-                    db.rollback()
-                else:
-                    db.rollback()
-                    raise
 
             engine = _build_engine(db)
             result = engine.authorize(
@@ -725,8 +692,6 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                 intent_hash=payload.intent.compute_hash(),
                 cart_hash=payload.cart.compute_hash(),
             )
-            db.commit()
-
             response = result.model_dump(mode="json")
             if result.status is AuthorizationStatus.REQUIRE_APPROVAL:
                 approval = _approval_for_authorization(
@@ -735,7 +700,7 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                     result=result,
                     expires_at=payload.intent.expires_at,
                 )
-                SQLiteAuditLog(db).record(
+                engine.audit.record(
                     event_type="APPROVAL_REQUESTED",
                     actor="system",
                     intent_id=approval.intent_id,
@@ -756,7 +721,12 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                     message=payment_execution.message,
                     is_mocked=payment_execution.is_mocked,
                 ).model_dump()
+            with DatabaseUnitOfWork(db):
+                pass
             return response
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.close()
 

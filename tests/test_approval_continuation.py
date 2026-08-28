@@ -244,6 +244,7 @@ def test_existing_unrelated_payment_mandate_cannot_be_substituted(tmp_path):
             approval_id=approval_b_id
         ).one()
         approval_b.continuation_payment_id = None
+        db.commit()
         approval_a.continuation_payment_id = payment_b_id
         db.commit()
     finally:

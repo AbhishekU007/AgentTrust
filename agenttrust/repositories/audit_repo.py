@@ -43,6 +43,8 @@ class SQLiteAuditLog(IAuditLog):
         decision: AuthorizationStatus | None = None,
         reason: str = "",
         data: dict[str, Any] | None = None,
+        *,
+        commit: bool = True,
     ) -> AuditEvent:
         
         # 1. Let the core log create the event and compute hashes correctly
@@ -71,7 +73,8 @@ class SQLiteAuditLog(IAuditLog):
             event_hash=ev.event_hash,
         )
         self.db.add(db_ev)
-        self.db.commit()
+        if commit and not self.db.info.get("coordinated_transaction"):
+            self.db.commit()
 
         return ev
 

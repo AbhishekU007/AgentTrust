@@ -22,6 +22,14 @@ class DBIntentMandate(Base):
     canonical_bytes_hex = Column(String, nullable=False)
 
 
+class DBSchemaMetadata(Base):
+    __tablename__ = "schema_metadata"
+
+    key = Column(String, primary_key=True)
+    value = Column(String, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class DBCartMandate(Base):
     __tablename__ = "cart_mandates"
 

@@ -10,7 +10,11 @@ import os
 DATABASE_URL = os.getenv("AGENTTRUST_DB_URL", "sqlite:///./agenttrust.db")
 
 def _sqlite_connect_args(database_url: str) -> dict:
-    return {"check_same_thread": False} if "sqlite" in database_url else {}
+    return (
+        {"check_same_thread": False, "timeout": 30}
+        if "sqlite" in database_url
+        else {}
+    )
 
 
 def build_engine(database_url: str | None = None):
@@ -36,6 +40,19 @@ def init_db(local_engine=None) -> None:
 
     target_engine = local_engine or engine
     Base.metadata.create_all(bind=target_engine)
+    with target_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT OR IGNORE INTO schema_metadata (key, value) "
+                "VALUES ('schema_version', '3.7')"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE schema_metadata SET value = '3.7', updated_at = CURRENT_TIMESTAMP "
+                "WHERE key = 'schema_version'"
+            )
+        )
     inspector = inspect(target_engine)
     if "approval_requests" in inspector.get_table_names():
         existing = {column["name"] for column in inspector.get_columns("approval_requests")}

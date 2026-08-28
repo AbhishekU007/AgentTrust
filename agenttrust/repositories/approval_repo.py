@@ -23,7 +23,7 @@ class SQLiteApprovalRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def create(self, approval: ApprovalRequest) -> ApprovalRequest:
+    def create(self, approval: ApprovalRequest, *, commit: bool = True) -> ApprovalRequest:
         self.db.add(
             DBApprovalRequest(
                 approval_id=approval.approval_id,
@@ -40,7 +40,8 @@ class SQLiteApprovalRepository:
                 decision_signature=approval.decision_signature,
             )
         )
-        self.db.commit()
+        if commit and not self.db.info.get("coordinated_transaction"):
+            self.db.commit()
         return approval
 
     def get(self, approval_id: str) -> ApprovalRequest | None:
@@ -93,6 +94,8 @@ class SQLiteApprovalRepository:
         approval_id: str,
         payment_id: str,
         completed_at: datetime,
+        *,
+        commit: bool = True,
     ) -> bool:
         """Atomically claim an approved request for one payment mandate."""
         statement = (
@@ -109,7 +112,11 @@ class SQLiteApprovalRepository:
         )
         result = self.db.execute(statement)
         if result.rowcount == 1:
+            if commit and not self.db.info.get("coordinated_transaction"):
+                self.db.commit()
             return True
+        # Refresh the session after a failed compare-and-set so callers do not
+        # observe a stale approval object during an idempotent retry.
         self.db.rollback()
         return False
 
