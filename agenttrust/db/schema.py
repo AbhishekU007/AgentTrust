@@ -56,6 +56,8 @@ class DBPaymentMandate(Base):
     payment_execution_status = Column(String, nullable=False, default="NOT_EXECUTED")
     payment_execution_error = Column(String, nullable=True)
     payment_executed_at = Column(DateTime(timezone=True), nullable=True)
+    approval_id = Column(String, nullable=True, unique=True, index=True)
+    authorization_id = Column(String, nullable=True, index=True)
 
 
 class DBAuthorizationDecision(Base):
@@ -69,6 +71,11 @@ class DBAuthorizationDecision(Base):
     reason = Column(String, nullable=False)
     checks = Column(JSON, nullable=False)
     payment_id = Column(String, nullable=True, index=True)
+    # Safe verification material retained for a later approval continuation.
+    intent_signature = Column(String, nullable=True)
+    user_public_key = Column(String, nullable=True)
+    intent_hash = Column(String, nullable=True)
+    cart_hash = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
@@ -87,6 +94,8 @@ class DBApprovalRequest(Base):
     decided_by = Column(String, nullable=True)
     approver_public_key = Column(String, nullable=True)
     decision_signature = Column(String, nullable=True)
+    continuation_payment_id = Column(String, nullable=True, unique=True, index=True)
+    continuation_completed_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class DBAuditEvent(Base):

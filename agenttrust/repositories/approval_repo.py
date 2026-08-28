@@ -2,6 +2,8 @@
 
 from datetime import datetime, timezone
 
+from datetime import datetime
+
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
@@ -47,6 +49,16 @@ class SQLiteApprovalRepository:
             return None
         return self._to_domain(record)
 
+    def get_by_authorization_id(self, authorization_id: str) -> ApprovalRequest | None:
+        record = (
+            self.db.query(DBApprovalRequest)
+            .filter(DBApprovalRequest.authorization_id == authorization_id)
+            .one_or_none()
+        )
+        if record is None:
+            return None
+        return self._to_domain(record)
+
     def save_transition(
         self,
         approval: ApprovalRequest,
@@ -75,6 +87,31 @@ class SQLiteApprovalRepository:
             )
         self.db.commit()
         return approval
+
+    def reserve_continuation(
+        self,
+        approval_id: str,
+        payment_id: str,
+        completed_at: datetime,
+    ) -> bool:
+        """Atomically claim an approved request for one payment mandate."""
+        statement = (
+            update(DBApprovalRequest)
+            .where(
+                DBApprovalRequest.approval_id == approval_id,
+                DBApprovalRequest.status == ApprovalStatus.APPROVED.value,
+                DBApprovalRequest.continuation_payment_id.is_(None),
+            )
+            .values(
+                continuation_payment_id=payment_id,
+                continuation_completed_at=completed_at,
+            )
+        )
+        result = self.db.execute(statement)
+        if result.rowcount == 1:
+            return True
+        self.db.rollback()
+        return False
 
     @staticmethod
     def _to_domain(record: DBApprovalRequest) -> ApprovalRequest:

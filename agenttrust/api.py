@@ -15,7 +15,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Body, FastAPI, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -46,6 +46,10 @@ from agenttrust.repositories.audit_repo import SQLiteAuditLog
 from agenttrust.repositories.approval_repo import SQLiteApprovalRepository
 from agenttrust.repositories.replay_repo import SQLiteReplayRegistry
 from agenttrust.repositories.transaction_repo import SQLiteTransactionRepository
+from agenttrust.services.approval_continuation import (
+    ApprovalContinuationError,
+    ApprovalContinuationService,
+)
 
 
 class AuthorizeRequest(BaseModel):
@@ -71,6 +75,10 @@ class ApprovalDecisionRequest(BaseModel):
     decided_at: datetime
     approver_public_key: str = Field(..., min_length=1)
     signature: str = Field(..., min_length=1)
+
+
+class EmptyContinuationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 @dataclass
@@ -235,18 +243,55 @@ def _persist_decision(
     db: Session,
     result: AuthorizationResult,
     payment_id: str | None,
-) -> None:
+    *,
+    intent_signature: str | None = None,
+    user_public_key: str | None = None,
+    intent_hash: str | None = None,
+    cart_hash: str | None = None,
+    decision_id: str | None = None,
+) -> str:
+    resolved_decision_id = decision_id or uuid.uuid4().hex
     db.add(
         DBAuthorizationDecision(
-            decision_id=uuid.uuid4().hex,
+            decision_id=resolved_decision_id,
             intent_id=result.intent_id,
             cart_id=result.cart_id,
             status=result.status.value,
             reason=result.reason,
             checks=[check.model_dump(mode="json") for check in result.checks],
             payment_id=payment_id,
+            intent_signature=intent_signature,
+            user_public_key=user_public_key,
+            intent_hash=intent_hash,
+            cart_hash=cart_hash,
         )
     )
+    return resolved_decision_id
+
+
+def _approval_for_authorization(
+    db: Session,
+    *,
+    authorization_id: str,
+    result: AuthorizationResult,
+    expires_at: datetime,
+) -> ApprovalRequest:
+    existing = SQLiteApprovalRepository(db).get_by_authorization_id(authorization_id)
+    if existing is not None:
+        return existing
+
+    requested_at = datetime.now(timezone.utc)
+    approval = ApprovalRequest(
+        approval_id=uuid.uuid4().hex,
+        authorization_id=authorization_id,
+        intent_id=result.intent_id,
+        cart_id=result.cart_id or "",
+        reason=result.reason,
+        requested_at=requested_at,
+        expires_at=expires_at,
+    )
+    SQLiteApprovalRepository(db).create(approval)
+    return approval
 
 
 def _payment_from_db(record: DBPaymentMandate) -> PaymentMandate:
@@ -494,6 +539,114 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
     ) -> ApprovalRequest:
         return _decide_approval(approval_id, payload, ApprovalStatus.REJECTED)
 
+    @app.post("/approvals/{approval_id}/continue")
+    def continue_approval(
+        approval_id: str, payload: EmptyContinuationRequest | None = Body(default=None)
+    ) -> dict[str, Any]:
+        if not approval_id.strip():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=ErrorResponse(
+                    code="invalid_approval_id",
+                    message="Approval ID must not be blank",
+                ).model_dump(),
+            )
+        db = _open_db()
+        try:
+            service = ApprovalContinuationService(
+                db=db,
+                policy=app.state.policy,
+                system_private_key=app.state.system_private_key,
+                system_public_key=app.state.system_public_key,
+            )
+            try:
+                payment, already_completed, authorization_id = (
+                    service.continue_approval(approval_id)
+                )
+            except ApprovalContinuationError as exc:
+                event_type = (
+                    "APPROVAL_CONTINUATION_ALREADY_COMPLETED"
+                    if exc.code == "continuation_already_completed"
+                    else "APPROVAL_CONTINUATION_REJECTED"
+                )
+                SQLiteAuditLog(db).record(
+                    event_type=event_type,
+                    actor="system",
+                    reason=str(exc),
+                    data={"approval_id": approval_id, "error_code": exc.code},
+                )
+                raise HTTPException(
+                    status_code=(
+                        status.HTTP_404_NOT_FOUND
+                        if exc.code == "approval_not_found"
+                        else status.HTTP_409_CONFLICT
+                    ),
+                    detail=ErrorResponse(
+                        code=exc.code,
+                        message=str(exc),
+                    ).model_dump(),
+                ) from exc
+
+            audit = SQLiteAuditLog(db)
+            if already_completed:
+                audit.record(
+                    event_type="APPROVAL_CONTINUATION_ALREADY_COMPLETED",
+                    actor="system",
+                    intent_id=payment.intent_id,
+                    cart_id=payment.cart_id,
+                    reason="Returning the existing continuation payment mandate",
+                    data={
+                        "approval_id": approval_id,
+                        "authorization_id": authorization_id,
+                        "payment_id": payment.payment_id,
+                    },
+                )
+            else:
+                audit.record(
+                    event_type="APPROVAL_CONTINUATION_STARTED",
+                    actor="system",
+                    intent_id=payment.intent_id,
+                    cart_id=payment.cart_id,
+                    reason="Approval continuation revalidated",
+                    data={
+                        "approval_id": approval_id,
+                        "authorization_id": authorization_id,
+                    },
+                )
+                audit.record(
+                    event_type="AUTHORIZATION_RESUMED",
+                    actor="system",
+                    intent_id=payment.intent_id,
+                    cart_id=payment.cart_id,
+                    decision=AuthorizationStatus.ALLOW,
+                    reason="Approved authorization resumed",
+                    data={
+                        "approval_id": approval_id,
+                        "authorization_id": authorization_id,
+                    },
+                )
+                audit.record(
+                    event_type="PAYMENT_MANDATE_CREATED_FROM_APPROVAL",
+                    actor="system",
+                    intent_id=payment.intent_id,
+                    cart_id=payment.cart_id,
+                    decision=AuthorizationStatus.ALLOW,
+                    reason="System-signed payment mandate created",
+                    data={
+                        "approval_id": approval_id,
+                        "authorization_id": authorization_id,
+                        "payment_id": payment.payment_id,
+                    },
+                )
+            return {
+                "approval_id": approval_id,
+                "authorization_id": authorization_id,
+                "payment_mandate": payment.model_dump(mode="json"),
+                "already_completed": already_completed,
+            }
+        finally:
+            db.close()
+
     @app.post("/authorize")
     def authorize(payload: AuthorizeRequest, execute: bool = True) -> dict[str, Any]:
         """
@@ -533,6 +686,7 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
 
             payment_execution: PaymentExecutionResult | None = None
             db_payment: DBPaymentMandate | None = None
+            decision_id: str | None = None
 
             # If the engine returned a PaymentMandate (ALLOW), always persist it.
             if result.payment_mandate is not None:
@@ -562,14 +716,38 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
                         },
                     )
 
-            _persist_decision(
+            decision_id = _persist_decision(
                 db,
                 result,
                 payment_id=result.payment_mandate.payment_id if result.payment_mandate else None,
+                intent_signature=payload.intent_signature,
+                user_public_key=payload.user_public_key,
+                intent_hash=payload.intent.compute_hash(),
+                cart_hash=payload.cart.compute_hash(),
             )
             db.commit()
 
             response = result.model_dump(mode="json")
+            if result.status is AuthorizationStatus.REQUIRE_APPROVAL:
+                approval = _approval_for_authorization(
+                    db,
+                    authorization_id=decision_id,
+                    result=result,
+                    expires_at=payload.intent.expires_at,
+                )
+                SQLiteAuditLog(db).record(
+                    event_type="APPROVAL_REQUESTED",
+                    actor="system",
+                    intent_id=approval.intent_id,
+                    cart_id=approval.cart_id,
+                    decision=AuthorizationStatus.REQUIRE_APPROVAL,
+                    reason=approval.reason,
+                    data={
+                        "approval_id": approval.approval_id,
+                        "authorization_id": approval.authorization_id,
+                    },
+                )
+                response["approval"] = approval.model_dump(mode="json")
             if payment_execution is not None:
                 response["payment_execution"] = PaymentExecutionResponse(
                     success=payment_execution.success,

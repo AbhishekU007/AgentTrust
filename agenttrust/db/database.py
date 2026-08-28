@@ -48,6 +48,53 @@ def init_db(local_engine=None) -> None:
                 connection.execute(
                     text("ALTER TABLE approval_requests ADD COLUMN decision_signature VARCHAR")
                 )
+    if "authorization_decisions" in inspector.get_table_names():
+        existing = {
+            column["name"]
+            for column in inspector.get_columns("authorization_decisions")
+        }
+        with target_engine.begin() as connection:
+            for column in (
+                "intent_signature",
+                "user_public_key",
+                "intent_hash",
+                "cart_hash",
+            ):
+                if column not in existing:
+                    connection.execute(
+                        text(
+                            f"ALTER TABLE authorization_decisions "
+                            f"ADD COLUMN {column} VARCHAR"
+                        )
+                    )
+    if "approval_requests" in inspector.get_table_names():
+        existing = {column["name"] for column in inspector.get_columns("approval_requests")}
+        with target_engine.begin() as connection:
+            if "continuation_payment_id" not in existing:
+                connection.execute(
+                    text(
+                        "ALTER TABLE approval_requests "
+                        "ADD COLUMN continuation_payment_id VARCHAR"
+                    )
+                )
+            if "continuation_completed_at" not in existing:
+                connection.execute(
+                    text(
+                        "ALTER TABLE approval_requests "
+                        "ADD COLUMN continuation_completed_at DATETIME"
+                    )
+                )
+    if "payment_mandates" in inspector.get_table_names():
+        existing = {column["name"] for column in inspector.get_columns("payment_mandates")}
+        with target_engine.begin() as connection:
+            if "approval_id" not in existing:
+                connection.execute(
+                    text("ALTER TABLE payment_mandates ADD COLUMN approval_id VARCHAR")
+                )
+            if "authorization_id" not in existing:
+                connection.execute(
+                    text("ALTER TABLE payment_mandates ADD COLUMN authorization_id VARCHAR")
+                )
 
 def get_db():
     """FastAPI dependency for database sessions."""
