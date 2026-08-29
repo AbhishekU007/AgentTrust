@@ -4,7 +4,7 @@
 
 > An authorization boundary between autonomous intent and financial execution.
 
-![AgentTrust Dashboard](assets\header.png)
+![AgentTrust Dashboard](assets/header.png)
 
 AgentTrust is a security-focused authorization gateway for autonomous payment workflows.
 
@@ -15,7 +15,7 @@ It sits between an AI agent or application and a payment provider, verifying cry
 ---
 
 ## Architecture
-![AgentTrust Architecture](assets\architecture.png)
+![AgentTrust Architecture](assets/architecture.png)
 
 ---
 
