@@ -9,8 +9,23 @@ Quick start
 1. Copy the example env file:
    cp .env.example .env
 2. (Optional) Fill in RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to enable real Razorpay Test Mode. If left empty, the adapter runs in MOCKED mode.
-3. Run the test suite:
+3. Start the API locally:
+   uvicorn agenttrust.api:app --reload
+4. Open the product demo in a browser:
+   http://localhost:8000/
+5. Run the test suite:
    python -m pytest
+
+Demo workflow
+-------------
+The browser UI at `/` is the simplest end-to-end workflow for AgentTrust:
+- configure a bearer token from `AGENTTRUST_API_TOKENS` if auth is enabled
+- submit an intent and cart with a user public key and intent signature
+- inspect the authorization decision (`ALLOW`, `BLOCK`, or `REQUIRE_APPROVAL`)
+- if approval is required, submit a signed approval decision to `/approvals/{approval_id}/approve`
+- continue the approved flow via `/approvals/{approval_id}/continue` to create the PaymentMandate
+- call `/payments/{payment_id}/execute` only when the user explicitly approves the payment
+- review `/audit` for the complete signed event trail
 
 Environment variables (.env.example)
 -----------------------------------

@@ -8,7 +8,10 @@ import secrets
 from dataclasses import dataclass
 from typing import Mapping
 
+from dotenv import load_dotenv
 from fastapi import Header, HTTPException, status
+
+load_dotenv()
 
 
 @dataclass(frozen=True)

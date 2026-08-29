@@ -65,6 +65,17 @@ def test_health_endpoint_returns_ok() -> None:
     assert body["service"] == "agenttrust"
 
 
+def test_root_page_serves_demo_ui() -> None:
+    client = TestClient(create_app(policy=_test_policy()))
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "AgentTrust Demo" in response.text
+    assert "Authorize intent" in response.text
+    assert "crypto.subtle.generateKey" in response.text
+    assert "signCanonicalPayload" in response.text
+    assert "approvalDecision" in response.text
+
+
 def test_authorize_valid_signed_payload_allows_and_creates_payment_mandate() -> None:
     client = TestClient(create_app(policy=_test_policy()))
     payload, _, _ = _build_signed_request()

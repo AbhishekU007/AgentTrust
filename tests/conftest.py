@@ -4,10 +4,12 @@ import os
 
 from fastapi.testclient import TestClient
 
+os.environ.setdefault(
+    "AGENTTRUST_API_TOKENS",
+    '{"demo-token":"demo-user","test-token":"__legacy_test__"}',
+)
+
 import agenttrust.api as api_module
-
-
-os.environ.setdefault("AGENTTRUST_API_TOKENS", '{"test-token":"__legacy_test__"}')
 
 
 def _legacy_test_principal(principal):

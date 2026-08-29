@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, status
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text, update
 from sqlalchemy.exc import IntegrityError
@@ -427,34 +428,44 @@ def _claim_payment_execution(db: Session, db_payment: DBPaymentMandate) -> tuple
         )
 
     execution_id = uuid.uuid4().hex
-    statement = (
-        update(DBPaymentMandate)
-        .where(
-            DBPaymentMandate.payment_id == db_payment.payment_id,
-            DBPaymentMandate.payment_execution_status.in_(
-                ("NOT_EXECUTED", "READY", "FAILED")
-            ),
-        )
-        .values(
-            payment_execution_status="EXECUTING",
-            payment_execution_id=execution_id,
-            payment_execution_started_at=datetime.now(timezone.utc),
-            payment_execution_error=None,
-            payment_execution_error_code=None,
-        )
-    )
-    result = db.execute(statement)
-    if result.rowcount != 1:
+    # Ensure the claim is atomic across concurrent calls. SQLite autocommit mode
+    # may already have a transaction open at this point; close any stale state and
+    # acquire an immediate write lock before updating the row.
+    if db.in_transaction():
         db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=ErrorResponse(
-                code="payment_execution_in_progress",
-                message="Payment mandate execution was claimed concurrently",
-            ).model_dump(),
+    db.execute(text("BEGIN IMMEDIATE"))
+    try:
+        statement = (
+            update(DBPaymentMandate)
+            .where(
+                DBPaymentMandate.payment_id == db_payment.payment_id,
+                DBPaymentMandate.payment_execution_status.in_(
+                    ("NOT_EXECUTED", "READY", "FAILED")
+                ),
+            )
+            .values(
+                payment_execution_status="EXECUTING",
+                payment_execution_id=execution_id,
+                payment_execution_started_at=datetime.now(timezone.utc),
+                payment_execution_error=None,
+                payment_execution_error_code=None,
+            )
         )
-    db.commit()
-    db.refresh(db_payment)
+        result = db.execute(statement)
+        if result.rowcount != 1:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=ErrorResponse(
+                    code="payment_execution_in_progress",
+                    message="Payment mandate execution was claimed concurrently",
+                ).model_dump(),
+            )
+        db.commit()
+        db.refresh(db_payment)
+    except Exception:
+        db.rollback()
+        raise
     return execution_id, True
 
 
@@ -611,7 +622,10 @@ def _validate_payment_for_execution(
                     message="Approved payment mandate linkage is invalid",
                 ).model_dump(),
             )
-        if approval.expires_at <= datetime.now(timezone.utc):
+        approval_expires_at = approval.expires_at
+        if approval_expires_at.tzinfo is None or approval_expires_at.utcoffset() is None:
+            approval_expires_at = approval_expires_at.replace(tzinfo=timezone.utc)
+        if approval_expires_at <= datetime.now(timezone.utc):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=ErrorResponse(
@@ -649,7 +663,7 @@ def _validate_payment_for_execution(
 
 
 def create_app(database_url: str | None = None, policy: PolicyConfig | None = None) -> FastAPI:
-    app = FastAPI(title="AgentTrust API", version="0.2.0")
+    app = FastAPI(title="AgentTrust API", version="0.4.1")
     resolved_policy = policy or _default_policy()
     session_factory, local_engine = build_session_factory(database_url)
     identity: SystemIdentity = load_system_identity()
@@ -733,6 +747,445 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
 
     def _audit_actor(principal: Principal | None) -> str:
         return principal.principal_id if principal else "system"
+
+    @app.get("/", include_in_schema=False)
+    def root() -> HTMLResponse:
+        html = r"""
+        <!doctype html>
+        <html lang="en">
+        <head>
+          <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>AgentTrust Demo</title>
+          <style>
+            :root {
+              color-scheme: light dark;
+              --bg: #0b1020;
+              --panel: #121b2d;
+              --panel-alt: #1a2640;
+              --accent: #7dd3fc;
+              --good: #34d399;
+              --warn: #fbbf24;
+              --bad: #f87171;
+              --text: #e5eefc;
+              --muted: #a9bad6;
+              --border: rgba(148, 163, 184, 0.35);
+            }
+            * { box-sizing: border-box; }
+            body {
+              margin: 0; font-family: Arial, sans-serif; background: linear-gradient(180deg, #0b1020, #111827);
+              color: var(--text); padding: 24px;
+            }
+            .wrap { max-width: 1100px; margin: 0 auto; }
+            h1 { margin: 0 0 8px; }
+            .sub { color: var(--muted); }
+            .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
+            .panel {
+              background: rgba(18, 27, 45, 0.9); border: 1px solid var(--border); border-radius: 12px; padding: 18px;
+              box-shadow: 0 8px 18px rgba(15, 23, 42, 0.28);
+            }
+            label { display: block; font-weight: 600; margin: 10px 0 6px; }
+            input, textarea, select, button {
+              width: 100%; padding: 9px 10px; border-radius: 8px; border: 1px solid var(--border);
+              background: rgba(15, 23, 42, 0.85); color: var(--text); font-size: 14px;
+            }
+            textarea { min-height: 80px; resize: vertical; }
+            button {
+              background: linear-gradient(180deg, #38bdf8, #2563eb); border: none; cursor: pointer; font-weight: 700; margin-top: 10px;
+            }
+            button.secondary { background: linear-gradient(180deg, #34d399, #059669); }
+            button.warn { background: linear-gradient(180deg, #fbbf24, #d97706); }
+            button.danger { background: linear-gradient(180deg, #f87171, #dc2626); }
+            .status {
+              margin-top: 12px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: rgba(15, 23, 42, 0.9);
+              white-space: pre-wrap; word-break: break-word; color: var(--text);
+            }
+            .ok { border-color: rgba(52, 211, 153, 0.5); color: #d1fae5; }
+            .error { border-color: rgba(248, 113, 113, 0.5); color: #fee2e2; }
+            .muted { color: var(--muted); }
+            .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+            .small { font-size: 12px; color: var(--muted); }
+            pre { overflow: auto; max-height: 380px; margin: 0; }
+          </style>
+        </head>
+        <body>
+          <div class="wrap">
+            <h1>AgentTrust Demo</h1>
+            <p class="sub">Authorize intent → approval → continuation → explicit payment execution</p>
+
+            <div class="grid">
+              <section class="panel">
+                <h2>Session</h2>
+                <label>API base URL</label>
+                <input id="baseUrl" value="http://localhost:8000" />
+                <label>Bearer token</label>
+                <input id="token" placeholder="Optional bearer token for protected routes" />
+                <button id="loadAudit">Load audit trail</button>
+                <div id="auditStatus" class="status muted">Ready.</div>
+              </section>
+
+              <section class="panel">
+                <h2>Intent / cart</h2>
+                <label>Description</label>
+                <input id="description" value="Buy running shoes" />
+                <div class="row">
+                  <div>
+                    <label>Max amount minor</label>
+                    <input id="maxAmountMinor" value="500000" />
+                  </div>
+                  <div>
+                    <label>Total amount minor</label>
+                    <input id="totalAmountMinor" value="479900" />
+                  </div>
+                </div>
+                <label>Allowed merchants (comma-separated)</label>
+                <input id="allowedMerchants" value="Amazon" />
+                <label>Allowed categories</label>
+                <input id="allowedCategories" value="Footwear" />
+                <label>Merchant</label>
+                <input id="merchant" value="Amazon" />
+                <label>Category</label>
+                <input id="category" value="Footwear" />
+                <label>Item name</label>
+                <input id="itemName" value="Nike Air Zoom Pegasus" />
+                <div class="row">
+                  <div>
+                    <label>Item price minor</label>
+                    <input id="itemPriceMinor" value="479900" />
+                  </div>
+                  <div>
+                    <label>Quantity</label>
+                    <input id="quantity" value="1" />
+                  </div>
+                </div>
+                <label>User public key (hex)</label>
+                <textarea id="userPublicKey" placeholder="Paste a valid Ed25519 public key in hex"></textarea>
+                <label>Intent signature (hex)</label>
+                <textarea id="intentSignature" placeholder="Paste the signature for the intent"></textarea>
+                <button id="authorizeBtn">Authorize intent</button>
+                <button id="authorizeExplicitBtn" class="secondary">Authorize and hold for explicit execution</button>
+              </section>
+            </div>
+
+            <section class="panel" style="margin-top:18px;">
+              <h2>Approval + continuation</h2>
+              <div class="row">
+                <div>
+                  <label>Approval ID</label>
+                  <input id="approvalId" placeholder="approval_id returned by authorize" />
+                </div>
+                <div>
+                  <label>Approval decision maker</label>
+                  <input id="decidedBy" value="demo-user" placeholder="must match authenticated principal" />
+                </div>
+              </div>
+              <label>Approver public key (hex)</label>
+              <textarea id="approverPublicKey" placeholder="Paste approver public key hex"></textarea>
+              <label>Approval signature (hex)</label>
+              <textarea id="approvalSignature" placeholder="Paste approval signature hex"></textarea>
+              <div class="row">
+                <div><button id="approveBtn" class="secondary">Approve</button></div>
+                <div><button id="rejectBtn" class="warn">Reject</button></div>
+              </div>
+              <button id="continueBtn">Continue approved approval</button>
+              <div class="row">
+                <div>
+                  <label>Payment mandate ID</label>
+                  <input id="paymentId" placeholder="payment_id from continuation or authorize" />
+                </div>
+                <div>
+                  <label>Decision time ISO</label>
+                  <input id="decisionTime" value="" />
+                </div>
+              </div>
+              <button id="executeBtn" class="danger">Explicitly execute payment</button>
+              <div id="actionStatus" class="status muted">No action yet.</div>
+            </section>
+
+            <section class="panel" style="margin-top:18px;">
+              <h2>Last API response</h2>
+              <pre id="responseBox" class="muted">{}</pre>
+            </section>
+          </div>
+
+          <script>
+            const el = (id) => document.getElementById(id);
+            const ui = {
+              baseUrl: el('baseUrl'),
+              token: el('token'),
+              actionStatus: el('actionStatus'),
+              responseBox: el('responseBox'),
+              auditStatus: el('auditStatus'),
+              approvalId: el('approvalId'),
+              paymentId: el('paymentId'),
+              decisionTime: el('decisionTime'),
+            };
+
+            const state = { userKeyPair: null, approverKeyPair: null, intentId: null };
+            // Returns UTC ISO string with microseconds (6 decimals) and 'Z' suffix
+            // Matches backend's _strict_json_serializer format: %Y-%m-%dT%H:%M:%S.%fZ
+            const todayIso = () => new Date(Date.now()).toISOString().replace(/(\.\d{3})Z$/, '$1000Z');
+            ui.decisionTime.value = todayIso();
+
+            function setStatus(node, text, kind = '') {
+              node.className = 'status ' + (kind || 'muted');
+              node.textContent = text;
+            }
+
+            function showJson(body) {
+              ui.responseBox.textContent = JSON.stringify(body, null, 2);
+            }
+
+            function headers(extra = {}) {
+              const auth = ui.token.value.trim();
+              const result = { 'Content-Type': 'application/json', ...extra };
+              if (auth) result.Authorization = `Bearer ${auth}`;
+              return result;
+            }
+
+            async function fetchJson(path, options = {}) {
+              const url = new URL(path, ui.baseUrl.value.replace(/\/$/, '') + '/');
+              const response = await fetch(url, {
+                headers: headers(),
+                ...options,
+                headers: { ...(headers()), ...(options.headers || {}) },
+              });
+              const text = await response.text();
+              let body = {};
+              try { body = text ? JSON.parse(text) : {}; } catch (error) { body = { raw: text }; }
+              if (!response.ok) {
+                throw new Error(JSON.stringify(body, null, 2));
+              }
+              return body;
+            }
+
+            function sortCanonical(value) {
+              if (value instanceof Date) {
+                return value.toISOString().replace(/(\.\d{3})Z$/, '$1000Z');
+              }
+              if (Array.isArray(value)) {
+                return value.map((item) => sortCanonical(item)).filter((item) => item !== undefined && item !== null);
+              }
+              if (value && typeof value === 'object') {
+                const sorted = {};
+                for (const key of Object.keys(value).sort()) {
+                  const nextValue = sortCanonical(value[key]);
+                  if (nextValue !== undefined && nextValue !== null) {
+                    sorted[key] = nextValue;
+                  }
+                }
+                return sorted;
+              }
+              return value;
+            }
+
+            function canonicalJson(value) {
+              return JSON.stringify(sortCanonical(value));
+            }
+
+            function bytesToHex(bytes) {
+              return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, '0')).join('');
+            }
+
+            async function generateKeyPair() {
+              if (!window.crypto || !window.crypto.subtle) {
+                throw new Error('Web Crypto Ed25519 is unavailable in this browser');
+              }
+              return window.crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
+            }
+
+            async function ensureUserKeyPair() {
+              if (!state.userKeyPair) {
+                state.userKeyPair = await generateKeyPair();
+                const rawPublicKey = new Uint8Array(await window.crypto.subtle.exportKey('raw', state.userKeyPair.publicKey));
+                el('userPublicKey').value = bytesToHex(rawPublicKey);
+              }
+              return state.userKeyPair;
+            }
+
+            async function ensureApproverKeyPair() {
+              if (!state.approverKeyPair) {
+                state.approverKeyPair = await generateKeyPair();
+                const rawPublicKey = new Uint8Array(await window.crypto.subtle.exportKey('raw', state.approverKeyPair.publicKey));
+                el('approverPublicKey').value = bytesToHex(rawPublicKey);
+              }
+              return state.approverKeyPair;
+            }
+
+            async function signCanonicalPayload(payload, privateKey) {
+              const bytes = new TextEncoder().encode(canonicalJson(payload));
+              const signature = await window.crypto.subtle.sign('Ed25519', privateKey, bytes);
+              return bytesToHex(new Uint8Array(signature));
+            }
+
+            function randomId() {
+              if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+              return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (char) => {
+                const random = Math.random() * 16 | 0;
+                const value = char === 'x' ? random : (random & 0x3 | 0x8);
+                return value.toString(16);
+              });
+            }
+
+            async function loadAudit() {
+              try {
+                const body = await fetchJson('/audit');
+                showJson(body);
+                setStatus(ui.auditStatus, 'Audit verified: ' + JSON.stringify(body.valid), body.valid ? 'ok' : 'error');
+              } catch (error) {
+                setStatus(ui.auditStatus, 'Audit lookup failed: ' + error.message, 'error');
+                showJson({ error: error.message });
+              }
+            }
+
+            async function submitAuthorize(executeFlag) {
+              const userKeyPair = await ensureUserKeyPair();
+              const now = new Date();
+              const intentId = state.intentId || randomId();
+              state.intentId = intentId;
+
+              const intent = {
+                intent_id: intentId,
+                description: el('description').value,
+                max_amount_minor: Number(el('maxAmountMinor').value),
+                currency: 'INR',
+                allowed_merchants: el('allowedMerchants').value.split(',').map((v) => v.trim()).filter(Boolean),
+                allowed_categories: el('allowedCategories').value.split(',').map((v) => v.trim()).filter(Boolean),
+                nonce: randomId(),
+                created_at: now,
+                expires_at: new Date(now.getTime() + 3600000),
+              };
+              const cart = {
+                cart_id: randomId(),
+                intent_id: intent.intent_id,
+                merchant: el('merchant').value,
+                category: el('category').value,
+                items: [{
+                  name: el('itemName').value,
+                  price_minor: Number(el('itemPriceMinor').value),
+                  quantity: Number(el('quantity').value),
+                }],
+                total_amount_minor: Number(el('totalAmountMinor').value),
+                currency: 'INR',
+                nonce: randomId(),
+                created_at: now,
+              };
+              const userPublicKey = bytesToHex(new Uint8Array(await window.crypto.subtle.exportKey('raw', userKeyPair.publicKey)));
+              const intentSignature = await signCanonicalPayload(intent, userKeyPair.privateKey);
+              const payload = { intent, intent_signature: intentSignature, user_public_key: userPublicKey, cart };
+              el('intentSignature').value = intentSignature;
+              el('userPublicKey').value = userPublicKey;
+
+              try {
+                const body = await fetchJson(`/authorize?execute=${String(executeFlag)}`, {
+                  method: 'POST',
+                  body: JSON.stringify(payload),
+                });
+                showJson(body);
+                if (body.approval && body.approval.approval_id) {
+                  ui.approvalId.value = body.approval.approval_id;
+                }
+                if (body.payment_mandate && body.payment_mandate.payment_id) {
+                  ui.paymentId.value = body.payment_mandate.payment_id;
+                }
+                setStatus(ui.actionStatus, 'Authorization result: ' + (body.status || body.detail?.code || 'unknown'), body.status === 'ALLOW' ? 'ok' : body.status === 'BLOCK' ? 'error' : '');
+              } catch (error) {
+                setStatus(ui.actionStatus, 'Authorize failed: ' + error.message, 'error');
+                showJson({ error: error.message });
+              }
+            }
+
+            async function decision(action) {
+              const approvalId = ui.approvalId.value.trim();
+              if (!approvalId) {
+                setStatus(ui.actionStatus, 'Approval ID is required before deciding', 'error');
+                showJson({ error: 'Approval ID is required before deciding' });
+                return;
+              }
+              const approval = await fetchJson(`/approvals/${approvalId}`);
+              const approverKeyPair = await ensureApproverKeyPair();
+              const decisionTime = ui.decisionTime.value || todayIso();
+              const approvalDecision = {
+                version: '1',
+                domain: 'agenttrust.approval-decision',
+                approval_id: approval.approval_id,
+                authorization_id: approval.authorization_id,
+                intent_id: approval.intent_id,
+                cart_id: approval.cart_id,
+                decision: action === 'approve' ? 'APPROVED' : 'REJECTED',
+                decided_at: new Date(decisionTime),
+                approver_id: el('decidedBy').value,
+                approver_public_key: bytesToHex(new Uint8Array(await window.crypto.subtle.exportKey('raw', approverKeyPair.publicKey))),
+              };
+              const signature = await signCanonicalPayload(approvalDecision, approverKeyPair.privateKey);
+              const payload = {
+                decided_by: el('decidedBy').value,
+                decided_at: decisionTime,
+                approver_public_key: approvalDecision.approver_public_key,
+                signature,
+              };
+              el('approverPublicKey').value = approvalDecision.approver_public_key;
+              el('approvalSignature').value = signature;
+
+              try {
+                const body = await fetchJson(`/approvals/${approvalId}/${action}`, { method: 'POST', body: JSON.stringify(payload) });
+                showJson(body);
+                ui.approvalId.value = body.approval_id || ui.approvalId.value;
+                setStatus(ui.actionStatus, `${action.toUpperCase()} completed`, 'ok');
+              } catch (error) {
+                setStatus(ui.actionStatus, `Approval ${action} failed: ` + error.message, 'error');
+                showJson({ error: error.message });
+              }
+            }
+
+            async function continueApproval() {
+              const approvalId = ui.approvalId.value.trim();
+              try {
+                const body = await fetchJson(`/approvals/${approvalId}/continue`, { method: 'POST', body: JSON.stringify({}) });
+                showJson(body);
+                if (body.payment_mandate && body.payment_mandate.payment_id) {
+                  ui.paymentId.value = body.payment_mandate.payment_id;
+                }
+                setStatus(ui.actionStatus, 'Continuation created payment mandate', 'ok');
+              } catch (error) {
+                setStatus(ui.actionStatus, 'Continuation failed: ' + error.message, 'error');
+                showJson({ error: error.message });
+              }
+            }
+
+            async function executePayment() {
+              const paymentId = ui.paymentId.value.trim();
+              try {
+                const body = await fetchJson(`/payments/${paymentId}/execute`, { method: 'POST', body: JSON.stringify({}) });
+                showJson(body);
+                setStatus(ui.actionStatus, 'Payment execution result: ' + (body.result?.success ? 'success' : 'failed'), body.result?.success ? 'ok' : 'error');
+              } catch (error) {
+                setStatus(ui.actionStatus, 'Payment execution failed: ' + error.message, 'error');
+                showJson({ error: error.message });
+              }
+            }
+
+            document.getElementById('loadAudit').addEventListener('click', loadAudit);
+            document.getElementById('authorizeBtn').addEventListener('click', () => submitAuthorize(false));
+            document.getElementById('authorizeExplicitBtn').addEventListener('click', () => submitAuthorize(true));
+            document.getElementById('approveBtn').addEventListener('click', () => decision('approve'));
+            document.getElementById('rejectBtn').addEventListener('click', () => decision('reject'));
+            document.getElementById('continueBtn').addEventListener('click', continueApproval);
+            document.getElementById('executeBtn').addEventListener('click', executePayment);
+
+            ensureUserKeyPair().catch((error) => {
+              setStatus(ui.actionStatus, 'Browser crypto setup failed: ' + error.message, 'error');
+              showJson({ error: error.message });
+            });
+            ensureApproverKeyPair().catch((error) => {
+              setStatus(ui.actionStatus, 'Approver crypto setup failed: ' + error.message, 'error');
+              showJson({ error: error.message });
+            });
+          </script>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=html)
 
     @app.get("/health")
     def health() -> dict[str, Any]:
