@@ -756,156 +756,779 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
         <head>
           <meta charset="utf-8" />
           <meta name="viewport" content="width=device-width, initial-scale=1" />
-          <title>AgentTrust Demo</title>
+          <title>AgentTrust • Payment Authorization Infrastructure</title>
           <style>
             :root {
-              color-scheme: light dark;
-              --bg: #0b1020;
-              --panel: #121b2d;
-              --panel-alt: #1a2640;
-              --accent: #7dd3fc;
-              --good: #34d399;
-              --warn: #fbbf24;
-              --bad: #f87171;
-              --text: #e5eefc;
-              --muted: #a9bad6;
-              --border: rgba(148, 163, 184, 0.35);
+              --bg: #07111d;
+              --bg-soft: #0d1727;
+              --panel: #111d2d;
+              --panel-soft: #162739;
+              --panel-alt: #0f1a2a;
+              --border: rgba(148, 163, 184, 0.2);
+              --text: #e7edf7;
+              --text-soft: #9aa9c2;
+              --text-faint: #7586a3;
+              --primary: #7dd3fc;
+              --primary-strong: #38bdf8;
+              --success: #34d399;
+              --warning: #fbbf24;
+              --danger: #f87171;
+              --shadow: rgba(3, 7, 18, 0.52);
             }
+
             * { box-sizing: border-box; }
+
+            html, body {
+              margin: 0;
+              min-height: 100%;
+              background:
+                radial-gradient(circle at top left, rgba(56, 189, 248, 0.14), transparent 28%),
+                linear-gradient(180deg, var(--bg), #0c1624 35%, #0a111b 100%);
+              color: var(--text);
+              font-family: Inter, "Segoe UI", sans-serif;
+            }
+
             body {
-              margin: 0; font-family: Arial, sans-serif; background: linear-gradient(180deg, #0b1020, #111827);
-              color: var(--text); padding: 24px;
+              padding: 32px 20px 48px;
             }
-            .wrap { max-width: 1100px; margin: 0 auto; }
-            h1 { margin: 0 0 8px; }
-            .sub { color: var(--muted); }
-            .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
+
+            a { color: inherit; text-decoration: none; }
+
+            .shell {
+              max-width: 1280px;
+              margin: 0 auto;
+            }
+
+            .topbar {
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+              gap: 16px;
+              margin-bottom: 20px;
+              padding: 16px 18px;
+              border: 1px solid var(--border);
+              border-radius: 18px;
+              background: rgba(15, 26, 42, 0.72);
+              box-shadow: 0 18px 32px var(--shadow);
+              backdrop-filter: blur(8px);
+            }
+
+            .brand {
+              display: flex;
+              align-items: center;
+              gap: 14px;
+            }
+
+            .brand-mark {
+              width: 42px;
+              height: 42px;
+              border-radius: 12px;
+              background: linear-gradient(180deg, rgba(125, 211, 252, 0.18), rgba(56, 189, 248, 0.06));
+              border: 1px solid rgba(125, 211, 252, 0.42);
+              display: grid;
+              place-items: center;
+              font-size: 1.05rem;
+              font-weight: 800;
+              color: var(--primary);
+              letter-spacing: 0.08em;
+            }
+
+            .brand-name {
+              font-size: 1.65rem;
+              font-weight: 800;
+              letter-spacing: -0.03em;
+            }
+
+            .brand-subtitle {
+              color: var(--text-soft);
+              font-size: 0.76rem;
+              letter-spacing: 0.11em;
+              text-transform: uppercase;
+            }
+
+            .topbar-meta {
+              display: flex;
+              align-items: center;
+              gap: 10px;
+            }
+
+            .badge {
+              display: inline-flex;
+              align-items: center;
+              gap: 8px;
+              border-radius: 999px;
+              padding: 8px 12px;
+              border: 1px solid rgba(125, 211, 252, 0.3);
+              background: rgba(9, 18, 30, 0.7);
+              color: var(--primary);
+              font-size: 0.72rem;
+              letter-spacing: 0.08em;
+              text-transform: uppercase;
+              font-weight: 700;
+            }
+
+            .dot {
+              width: 8px;
+              height: 8px;
+              border-radius: 50%;
+              background: var(--success);
+              box-shadow: 0 0 10px rgba(52, 211, 153, 0.8);
+            }
+
+            .icon-btn {
+              width: 38px;
+              height: 38px;
+              border: 1px solid var(--border);
+              border-radius: 10px;
+              background: rgba(15, 26, 42, 0.9);
+              color: var(--text-soft);
+              font-size: 1rem;
+            }
+
+            .progress {
+              display: grid;
+              grid-template-columns: repeat(6, minmax(0, 1fr));
+              gap: 12px;
+              margin: 0 0 24px;
+            }
+
+            .step {
+              position: relative;
+              display: flex;
+              align-items: center;
+              gap: 10px;
+              padding: 12px 14px;
+              border: 1px solid var(--border);
+              border-radius: 14px;
+              background: rgba(11, 18, 28, 0.7);
+              min-height: 66px;
+            }
+
+            .step .num {
+              width: 26px;
+              height: 26px;
+              border-radius: 8px;
+              display: grid;
+              place-items: center;
+              background: rgba(125, 211, 252, 0.12);
+              border: 1px solid rgba(125, 211, 252, 0.32);
+              color: var(--primary);
+              font-size: 0.75rem;
+              font-weight: 800;
+            }
+
+            .step strong {
+              display: block;
+              font-size: 0.8rem;
+              letter-spacing: 0.03em;
+              color: var(--text);
+            }
+
+            .layout {
+              display: grid;
+              grid-template-columns: minmax(0, 1.05fr) minmax(0, 1.3fr);
+              gap: 20px;
+            }
+
             .panel {
-              background: rgba(18, 27, 45, 0.9); border: 1px solid var(--border); border-radius: 12px; padding: 18px;
-              box-shadow: 0 8px 18px rgba(15, 23, 42, 0.28);
+              border: 1px solid var(--border);
+              box-shadow: 0 18px 28px var(--shadow);
+              background: rgba(15, 26, 42, 0.82);
+              border-radius: 20px;
+              padding: 20px;
             }
-            label { display: block; font-weight: 600; margin: 10px 0 6px; }
-            input, textarea, select, button {
-              width: 100%; padding: 9px 10px; border-radius: 8px; border: 1px solid var(--border);
-              background: rgba(15, 23, 42, 0.85); color: var(--text); font-size: 14px;
+
+            .panel + .panel { margin-top: 18px; }
+
+            .stack {
+              display: flex;
+              flex-direction: column;
+              gap: 18px;
             }
-            textarea { min-height: 80px; resize: vertical; }
+
+            .panel-header {
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+              margin-bottom: 18px;
+            }
+
+            .panel-header h2 {
+              margin: 0;
+              font-size: 1.06rem;
+              letter-spacing: -0.02em;
+            }
+
+            .panel-kicker {
+              color: var(--text-soft);
+              font-size: 0.68rem;
+              letter-spacing: 0.12em;
+              text-transform: uppercase;
+              font-weight: 700;
+            }
+
+            .section-grid {
+              display: grid;
+              grid-template-columns: repeat(2, minmax(0, 1fr));
+              gap: 12px;
+            }
+
+            label {
+              display: block;
+              margin: 0 0 7px;
+              font-size: 0.74rem;
+              letter-spacing: 0.08em;
+              text-transform: uppercase;
+              color: var(--text-soft);
+              font-weight: 700;
+            }
+
+            input, textarea, button {
+              font: inherit;
+            }
+
+            input, textarea {
+              width: 100%;
+              border-radius: 12px;
+              border: 1px solid var(--border);
+              background: rgba(9, 18, 30, 0.8);
+              color: var(--text);
+              padding: 11px 12px;
+              transition: border-color 0.15s ease, box-shadow 0.15s ease;
+            }
+
+            input:focus, textarea:focus {
+              outline: none;
+              border-color: rgba(125, 211, 252, 0.6);
+              box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.08);
+            }
+
+            textarea {
+              min-height: 88px;
+              resize: vertical;
+            }
+
+            .field-block + .field-block { margin-top: 14px; }
+
+            .row { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
+
+            .button-row {
+              display: grid;
+              grid-template-columns: repeat(2, minmax(0,1fr));
+              gap: 10px;
+              margin-top: 12px;
+            }
+
             button {
-              background: linear-gradient(180deg, #38bdf8, #2563eb); border: none; cursor: pointer; font-weight: 700; margin-top: 10px;
+              border: 1px solid transparent;
+              border-radius: 12px;
+              padding: 11px 14px;
+              background: linear-gradient(180deg, rgba(56, 189, 248, 0.2), rgba(37, 99, 235, 0.25));
+              color: var(--text);
+              font-weight: 700;
+              cursor: pointer;
+              transition: transform 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
             }
-            button.secondary { background: linear-gradient(180deg, #34d399, #059669); }
-            button.warn { background: linear-gradient(180deg, #fbbf24, #d97706); }
-            button.danger { background: linear-gradient(180deg, #f87171, #dc2626); }
+
+            button:hover { transform: translateY(-1px); }
+            button:active { transform: translateY(0); }
+
+            button.primary {
+              background: linear-gradient(180deg, rgba(125, 211, 252, 0.22), rgba(59, 130, 246, 0.28));
+              border-color: rgba(125, 211, 252, 0.42);
+            }
+
+            button.secondary {
+              background: linear-gradient(180deg, rgba(52, 211, 153, 0.18), rgba(5, 150, 105, 0.2));
+              border-color: rgba(52, 211, 153, 0.32);
+            }
+
+            button.warn {
+              background: linear-gradient(180deg, rgba(251, 191, 36, 0.16), rgba(217, 119, 6, 0.2));
+              border-color: rgba(251, 191, 36, 0.38);
+            }
+
+            button.danger {
+              background: linear-gradient(180deg, rgba(248, 113, 113, 0.18), rgba(220, 38, 38, 0.2));
+              border-color: rgba(248, 113, 113, 0.32);
+            }
+
+            .decision-panel {
+              display: flex;
+              flex-direction: column;
+              gap: 14px;
+            }
+
+            .decision-badge {
+              display: inline-flex;
+              align-items: center;
+              justify-content: center;
+              width: fit-content;
+              min-width: 126px;
+              padding: 10px 16px;
+              border-radius: 999px;
+              font-size: 0.76rem;
+              font-weight: 800;
+              letter-spacing: 0.18em;
+              text-transform: uppercase;
+              border: 1px solid rgba(52, 211, 153, 0.32);
+              background: rgba(52, 211, 153, 0.08);
+              color: var(--success);
+            }
+
+            .decision-badge.block {
+              border-color: rgba(248, 113, 113, 0.32);
+              background: rgba(248, 113, 113, 0.08);
+              color: var(--danger);
+            }
+
+            .decision-badge.approval {
+              border-color: rgba(251, 191, 36, 0.33);
+              background: rgba(251, 191, 36, 0.08);
+              color: var(--warning);
+            }
+
+            .meta-grid {
+              display: grid;
+              grid-template-columns: repeat(2, minmax(0, 1fr));
+              gap: 12px;
+            }
+
+            .meta-item {
+              border: 1px solid var(--border);
+              background: rgba(9, 18, 30, 0.72);
+              border-radius: 14px;
+              padding: 12px 14px;
+            }
+
+            .meta-label {
+              display: block;
+              color: var(--text-soft);
+              font-size: 0.68rem;
+              letter-spacing: 0.08em;
+              text-transform: uppercase;
+              margin-bottom: 5px;
+            }
+
+            .meta-value {
+              font-size: 0.98rem;
+              font-weight: 700;
+              color: var(--text);
+            }
+
+            .checklist {
+              list-style: none;
+              padding: 0;
+              margin: 0;
+              display: grid;
+              gap: 10px;
+            }
+
+            .checklist li {
+              display: flex;
+              align-items: center;
+              gap: 10px;
+              padding: 8px 10px;
+              border-radius: 10px;
+              border: 1px solid var(--border);
+              background: rgba(9, 18, 30, 0.5);
+              color: var(--text-soft);
+            }
+
+            .checklist li::before {
+              content: "✓";
+              width: 18px;
+              height: 18px;
+              display: inline-grid;
+              place-items: center;
+              border-radius: 50%;
+              background: rgba(52, 211, 153, 0.12);
+              color: var(--success);
+              font-size: 0.7rem;
+              font-weight: 800;
+            }
+
             .status {
-              margin-top: 12px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: rgba(15, 23, 42, 0.9);
-              white-space: pre-wrap; word-break: break-word; color: var(--text);
+              margin-top: 12px;
+              padding: 10px 12px;
+              border-radius: 12px;
+              border: 1px solid var(--border);
+              background: rgba(9, 18, 30, 0.72);
+              white-space: pre-wrap;
+              word-break: break-word;
+              color: var(--text);
+              line-height: 1.5;
+              font-size: 0.9rem;
             }
-            .ok { border-color: rgba(52, 211, 153, 0.5); color: #d1fae5; }
-            .error { border-color: rgba(248, 113, 113, 0.5); color: #fee2e2; }
-            .muted { color: var(--muted); }
-            .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-            .small { font-size: 12px; color: var(--muted); }
-            pre { overflow: auto; max-height: 380px; margin: 0; }
+
+            .status.ok {
+              color: #d8ffef;
+              border-color: rgba(52, 211, 153, 0.3);
+              background: rgba(52, 211, 153, 0.09);
+            }
+
+            .status.error {
+              color: #ffe5e5;
+              border-color: rgba(248, 113, 113, 0.3);
+              background: rgba(248, 113, 113, 0.08);
+            }
+
+            .status.muted {
+              color: var(--text-soft);
+            }
+
+            .audit-table {
+              width: 100%;
+              border-collapse: collapse;
+              font-size: 0.9rem;
+              margin-top: 10px;
+            }
+
+            .audit-table th,
+            .audit-table td {
+              text-align: left;
+              padding: 11px 10px;
+              border-bottom: 1px solid var(--border);
+              vertical-align: top;
+            }
+
+            .audit-table th {
+              color: var(--text-soft);
+              letter-spacing: 0.08em;
+              text-transform: uppercase;
+              font-size: 0.67rem;
+              font-weight: 800;
+            }
+
+            .pill-status {
+              display: inline-flex;
+              align-items: center;
+              border-radius: 999px;
+              padding: 5px 8px;
+              font-size: 0.7rem;
+              font-weight: 700;
+              letter-spacing: 0.06em;
+              text-transform: uppercase;
+              border: 1px solid var(--border);
+              background: rgba(9, 18, 30, 0.72);
+            }
+
+            .pill-status.success { color: var(--success); border-color: rgba(52, 211, 153, 0.35); }
+            .pill-status.warning { color: var(--warning); border-color: rgba(251, 191, 36, 0.38); }
+            .pill-status.danger { color: var(--danger); border-color: rgba(248, 113, 113, 0.35); }
+
+            details {
+              border: 1px solid var(--border);
+              border-radius: 14px;
+              background: rgba(9, 18, 30, 0.7);
+              overflow: hidden;
+            }
+
+            details summary {
+              list-style: none;
+              cursor: pointer;
+              padding: 12px 14px;
+              font-weight: 700;
+              color: var(--text-soft);
+            }
+
+            details summary::-webkit-details-marker { display: none; }
+
+            details[open] summary {
+              border-bottom: 1px solid var(--border);
+            }
+
+            pre {
+              margin: 0;
+              padding: 14px;
+              max-height: 360px;
+              overflow: auto;
+              white-space: pre-wrap;
+              word-break: break-word;
+              color: var(--text-soft);
+              font-size: 0.82rem;
+              line-height: 1.6;
+            }
+
+            @media (max-width: 980px) {
+              .layout {
+                grid-template-columns: 1fr;
+              }
+              .progress { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            }
+
+            @media (max-width: 620px) {
+              body { padding: 18px 12px 32px; }
+              .topbar { flex-direction: column; align-items: flex-start; }
+              .topbar-meta { width: 100%; justify-content: space-between; }
+              .section-grid, .row, .meta-grid, .button-row { grid-template-columns: 1fr; }
+              .progress { grid-template-columns: 1fr; }
+            }
           </style>
         </head>
         <body>
-          <div class="wrap">
-            <h1>AgentTrust Demo</h1>
-            <p class="sub">Authorize intent → approval → continuation → explicit payment execution</p>
-
-            <div class="grid">
-              <section class="panel">
-                <h2>Session</h2>
-                <label>API base URL</label>
-                <input id="baseUrl" value="http://localhost:8000" />
-                <label>Bearer token</label>
-                <input id="token" placeholder="Optional bearer token for protected routes" />
-                <button id="loadAudit">Load audit trail</button>
-                <div id="auditStatus" class="status muted">Ready.</div>
-              </section>
-
-              <section class="panel">
-                <h2>Intent / cart</h2>
-                <label>Description</label>
-                <input id="description" value="Buy running shoes" />
-                <div class="row">
-                  <div>
-                    <label>Max amount minor</label>
-                    <input id="maxAmountMinor" value="500000" />
-                  </div>
-                  <div>
-                    <label>Total amount minor</label>
-                    <input id="totalAmountMinor" value="479900" />
-                  </div>
+          <div class="shell">
+            <header class="topbar">
+              <div class="brand">
+                <div class="brand-mark">A</div>
+                <div>
+                  <div class="brand-name">AgentTrust Demo</div>
+                  <div class="brand-subtitle">Payment Authorization Infrastructure</div>
                 </div>
-                <label>Allowed merchants (comma-separated)</label>
-                <input id="allowedMerchants" value="Amazon" />
-                <label>Allowed categories</label>
-                <input id="allowedCategories" value="Footwear" />
-                <label>Merchant</label>
-                <input id="merchant" value="Amazon" />
-                <label>Category</label>
-                <input id="category" value="Footwear" />
-                <label>Item name</label>
-                <input id="itemName" value="Nike Air Zoom Pegasus" />
-                <div class="row">
-                  <div>
-                    <label>Item price minor</label>
-                    <input id="itemPriceMinor" value="479900" />
-                  </div>
-                  <div>
-                    <label>Quantity</label>
-                    <input id="quantity" value="1" />
-                  </div>
-                </div>
-                <label>User public key (hex)</label>
-                <textarea id="userPublicKey" placeholder="Paste a valid Ed25519 public key in hex"></textarea>
-                <label>Intent signature (hex)</label>
-                <textarea id="intentSignature" placeholder="Paste the signature for the intent"></textarea>
-                <button id="authorizeBtn">Authorize intent</button>
-                <button id="authorizeExplicitBtn" class="secondary">Authorize and hold for explicit execution</button>
-              </section>
+              </div>
+              <div class="topbar-meta">
+                <div class="badge"><span class="dot"></span> Authenticated session</div>
+                <button class="icon-btn" aria-label="Developer settings">⚙</button>
+              </div>
+            </header>
+
+            <div class="progress" aria-label="Authorization workflow stages">
+              <div class="step"><div class="num">1</div><div><strong>Intent</strong></div></div>
+              <div class="step"><div class="num">2</div><div><strong>Authorization</strong></div></div>
+              <div class="step"><div class="num">3</div><div><strong>Approval</strong></div></div>
+              <div class="step"><div class="num">4</div><div><strong>Mandate</strong></div></div>
+              <div class="step"><div class="num">5</div><div><strong>Execution</strong></div></div>
+              <div class="step"><div class="num">6</div><div><strong>Audit</strong></div></div>
             </div>
 
-            <section class="panel" style="margin-top:18px;">
-              <h2>Approval + continuation</h2>
-              <div class="row">
-                <div>
-                  <label>Approval ID</label>
-                  <input id="approvalId" placeholder="approval_id returned by authorize" />
-                </div>
-                <div>
-                  <label>Approval decision maker</label>
-                  <input id="decidedBy" value="demo-user" placeholder="must match authenticated principal" />
-                </div>
-              </div>
-              <label>Approver public key (hex)</label>
-              <textarea id="approverPublicKey" placeholder="Paste approver public key hex"></textarea>
-              <label>Approval signature (hex)</label>
-              <textarea id="approvalSignature" placeholder="Paste approval signature hex"></textarea>
-              <div class="row">
-                <div><button id="approveBtn" class="secondary">Approve</button></div>
-                <div><button id="rejectBtn" class="warn">Reject</button></div>
-              </div>
-              <button id="continueBtn">Continue approved approval</button>
-              <div class="row">
-                <div>
-                  <label>Payment mandate ID</label>
-                  <input id="paymentId" placeholder="payment_id from continuation or authorize" />
-                </div>
-                <div>
-                  <label>Decision time ISO</label>
-                  <input id="decisionTime" value="" />
-                </div>
-              </div>
-              <button id="executeBtn" class="danger">Explicitly execute payment</button>
-              <div id="actionStatus" class="status muted">No action yet.</div>
-            </section>
+            <div class="layout">
+              <div class="stack">
+                <section class="panel">
+                  <div class="panel-header">
+                    <h2>Session</h2>
+                    <span class="panel-kicker">Developer</span>
+                  </div>
+                  <div class="field-block">
+                    <label for="baseUrl">API base URL</label>
+                    <input id="baseUrl" value="http://localhost:8000" />
+                  </div>
+                  <div class="field-block">
+                    <label for="token">Bearer token</label>
+                    <input id="token" placeholder="demo-token" />
+                  </div>
+                  <div class="button-row">
+                    <button id="loadAudit" class="primary">Load audit trail</button>
+                    <button class="secondary" type="button">Session status</button>
+                  </div>
+                  <div id="auditStatus" class="status muted">Ready.</div>
+                </section>
 
-            <section class="panel" style="margin-top:18px;">
-              <h2>Last API response</h2>
-              <pre id="responseBox" class="muted">{}</pre>
-            </section>
+                <section class="panel">
+                  <div class="panel-header">
+                    <h2>Intent</h2>
+                    <span class="panel-kicker">Step 1</span>
+                  </div>
+                  <div class="field-block">
+                    <label for="description">Description</label>
+                    <input id="description" value="Buy running shoes" />
+                  </div>
+                  <div class="row">
+                    <div class="field-block">
+                      <label for="maxAmountMinor">Amount</label>
+                      <input id="maxAmountMinor" value="500000" />
+                    </div>
+                    <div class="field-block">
+                      <label for="totalAmountMinor">Cart total</label>
+                      <input id="totalAmountMinor" value="479900" />
+                    </div>
+                  </div>
+                  <div class="row">
+                    <div class="field-block">
+                      <label for="merchant">Merchant</label>
+                      <input id="merchant" value="Amazon" />
+                    </div>
+                    <div class="field-block">
+                      <label for="category">Category</label>
+                      <input id="category" value="Footwear" />
+                    </div>
+                  </div>
+                  <div class="row">
+                    <div class="field-block">
+                      <label for="allowedMerchants">Allowed merchants</label>
+                      <input id="allowedMerchants" value="Amazon" />
+                    </div>
+                    <div class="field-block">
+                      <label for="allowedCategories">Allowed categories</label>
+                      <input id="allowedCategories" value="Footwear" />
+                    </div>
+                  </div>
+                  <div class="field-block">
+                    <label for="itemName">Item</label>
+                    <input id="itemName" value="Nike Air Zoom Pegasus" />
+                  </div>
+                  <div class="row">
+                    <div class="field-block">
+                      <label for="itemPriceMinor">Item price</label>
+                      <input id="itemPriceMinor" value="479900" />
+                    </div>
+                    <div class="field-block">
+                      <label for="quantity">Quantity</label>
+                      <input id="quantity" value="1" />
+                    </div>
+                  </div>
+                  <div class="field-block">
+                    <label for="currency">Currency</label>
+                    <input id="currency" value="INR" readonly />
+                  </div>
+                  <div class="field-block">
+                    <label>Signing material</label>
+                    <textarea id="userPublicKey" placeholder="Ed25519 public key (hex)"></textarea>
+                  </div>
+                  <div class="field-block">
+                    <label>Intent signature</label>
+                    <textarea id="intentSignature" placeholder="Signed canonical intent bytes (hex)"></textarea>
+                  </div>
+                  <div class="button-row">
+                    <button id="authorizeBtn" class="primary">Authorize intent</button>
+                    <button id="authorizeExplicitBtn" class="secondary">Authorize & hold</button>
+                  </div>
+                </section>
+              </div>
+
+              <div class="stack">
+                <section class="panel decision-panel">
+                  <div class="panel-header">
+                    <h2>Authorization result</h2>
+                    <span class="panel-kicker">Step 2</span>
+                  </div>
+                  <div class="decision-badge">ALLOW</div>
+                  <div class="meta-grid">
+                    <div class="meta-item">
+                      <span class="meta-label">Amount</span>
+                      <span class="meta-value">₹4,799.00</span>
+                    </div>
+                    <div class="meta-item">
+                      <span class="meta-label">Merchant</span>
+                      <span class="meta-value">Amazon</span>
+                    </div>
+                    <div class="meta-item">
+                      <span class="meta-label">Category</span>
+                      <span class="meta-value">Footwear</span>
+                    </div>
+                    <div class="meta-item">
+                      <span class="meta-label">Decision</span>
+                      <span class="meta-value">Policy passed</span>
+                    </div>
+                  </div>
+                  <div>
+                    <div class="meta-label">Decision reason</div>
+                    <div class="meta-value">Intent, cart, and policy checks are consistent with the authorized mandate.</div>
+                  </div>
+                  <ul class="checklist">
+                    <li>Intent hash and cart hash are linked</li>
+                    <li>Cryptographic signature validated</li>
+                    <li>Merchant is on the allowlist</li>
+                    <li>Category is permitted</li>
+                    <li>Amount is within the configured policy threshold</li>
+                  </ul>
+                  <div class="status ok">Authorization status: ALLOW. No payment execution is triggered until an explicit action is performed.</div>
+                </section>
+
+                <section class="panel">
+                  <div class="panel-header">
+                    <h2>Approval</h2>
+                    <span class="panel-kicker">Step 3</span>
+                  </div>
+                  <div class="field-block">
+                    <label for="approvalId">Approval ID</label>
+                    <input id="approvalId" placeholder="approval_id returned by authorize" />
+                  </div>
+                  <div class="row">
+                    <div class="field-block">
+                      <label for="decidedBy">Decision maker</label>
+                      <input id="decidedBy" value="demo-user" />
+                    </div>
+                    <div class="field-block">
+                      <label for="decisionTime">Decision time</label>
+                      <input id="decisionTime" value="" />
+                    </div>
+                  </div>
+                  <div class="field-block">
+                    <label>Approver public key</label>
+                    <textarea id="approverPublicKey" placeholder="Approver Ed25519 public key (hex)"></textarea>
+                  </div>
+                  <div class="field-block">
+                    <label>Approval signature</label>
+                    <textarea id="approvalSignature" placeholder="Approval signature (hex)"></textarea>
+                  </div>
+                  <div class="button-row">
+                    <button id="approveBtn" class="secondary">Approve</button>
+                    <button id="rejectBtn" class="warn">Reject</button>
+                  </div>
+                  <div class="field-block">
+                    <button id="continueBtn" class="primary">Continue approved approval</button>
+                  </div>
+                </section>
+
+                <section class="panel">
+                  <div class="panel-header">
+                    <h2>Payment mandate</h2>
+                    <span class="panel-kicker">Step 4</span>
+                  </div>
+                  <div class="meta-grid">
+                    <div class="meta-item">
+                      <span class="meta-label">Amount</span>
+                      <span class="meta-value">₹4,799.00</span>
+                    </div>
+                    <div class="meta-item">
+                      <span class="meta-label">Merchant</span>
+                      <span class="meta-value">Amazon</span>
+                    </div>
+                    <div class="meta-item">
+                      <span class="meta-label">Authorization</span>
+                      <span class="meta-value">Verified</span>
+                    </div>
+                    <div class="meta-item">
+                      <span class="meta-label">Approval</span>
+                      <span class="meta-value">Pending</span>
+                    </div>
+                  </div>
+                  <div class="field-block">
+                    <label for="paymentId">Mandate ID</label>
+                    <input id="paymentId" placeholder="payment_id from continuation or authorize" />
+                  </div>
+                  <div class="field-block">
+                    <button id="executeBtn" class="danger">Explicitly execute payment</button>
+                  </div>
+                  <div class="status muted">Authorization does not automatically execute payment. Explicit execution remains the final payment boundary.</div>
+                </section>
+
+                <section class="panel">
+                  <div class="panel-header">
+                    <h2>Execution result</h2>
+                    <span class="panel-kicker">Step 5</span>
+                  </div>
+                  <div class="status ok">MOCK / TEST MODE: payment execution succeeded once and remains isolated to the demo environment.</div>
+                  <div id="actionStatus" class="status muted">No action yet.</div>
+                </section>
+
+                <section class="panel">
+                  <div class="panel-header">
+                    <h2>Audit</h2>
+                    <span class="panel-kicker">Step 6</span>
+                  </div>
+                  <table class="audit-table" aria-live="polite">
+                    <thead>
+                      <tr>
+                        <th>Event</th>
+                        <th>Timestamp</th>
+                        <th>Status</th>
+                        <th>Chain</th>
+                      </tr>
+                    </thead>
+                    <tbody id="auditRows">
+                      <tr><td colspan="4">No audit entries loaded yet.</td></tr>
+                    </tbody>
+                  </table>
+                  <div class="field-block" style="margin-top:14px;">
+                    <details>
+                      <summary>Developer response</summary>
+                      <pre id="responseBox">{}</pre>
+                    </details>
+                  </div>
+                </section>
+              </div>
+            </div>
           </div>
 
           <script>
@@ -922,8 +1545,6 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
             };
 
             const state = { userKeyPair: null, approverKeyPair: null, intentId: null };
-            // Returns UTC ISO string with microseconds (6 decimals) and 'Z' suffix
-            // Matches backend's _strict_json_serializer format: %Y-%m-%dT%H:%M:%S.%fZ
             const todayIso = () => new Date(Date.now()).toISOString().replace(/(\.\d{3})Z$/, '$1000Z');
             ui.decisionTime.value = todayIso();
 
@@ -934,6 +1555,44 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
 
             function showJson(body) {
               ui.responseBox.textContent = JSON.stringify(body, null, 2);
+            }
+
+            function renderAuditTable(data) {
+              const entries = Array.isArray(data?.events)
+                ? data.events
+                : Array.isArray(data?.audit)
+                  ? data.audit
+                  : Array.isArray(data?.trail)
+                    ? data.trail
+                    : [];
+
+              const tbody = document.getElementById('auditRows');
+              if (!tbody) return;
+
+              if (!entries.length) {
+                tbody.innerHTML = '<tr><td colspan="4">No audit entries loaded yet.</td></tr>';
+                return;
+              }
+
+              tbody.innerHTML = entries.map((event) => {
+                const type = event.type || event.event_type || event.name || 'EVENT';
+                const ts = event.timestamp || event.created_at || event.time || '-';
+                const status = event.status || (event.valid === false ? 'FAILED' : 'VERIFIED');
+                const chain = event.chain_verified ?? event.valid ?? event.verified ?? 'n/a';
+                const statusClass = status === 'VERIFIED' || status === 'OK' || status === 'ALLOW'
+                  ? 'success'
+                  : status === 'REJECTED' || status === 'FAILED' || status === 'BLOCK'
+                    ? 'danger'
+                    : 'warning';
+                return `
+                  <tr>
+                    <td>${String(type)}</td>
+                    <td>${String(ts)}</td>
+                    <td><span class="pill-status ${statusClass}">${String(status)}</span></td>
+                    <td>${String(chain)}</td>
+                  </tr>
+                `;
+              }).join('');
             }
 
             function headers(extra = {}) {
@@ -1030,6 +1689,7 @@ def create_app(database_url: str | None = None, policy: PolicyConfig | None = No
             async function loadAudit() {
               try {
                 const body = await fetchJson('/audit');
+                renderAuditTable(body);
                 showJson(body);
                 setStatus(ui.auditStatus, 'Audit verified: ' + JSON.stringify(body.valid), body.valid ? 'ok' : 'error');
               } catch (error) {
