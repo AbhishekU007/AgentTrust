@@ -1,103 +1,539 @@
-AgentTrust — Milestone 2
+# AgentTrust
 
-Purpose
--------
-AgentTrust is a prototype authorization gateway that verifies user-signed IntentMandates, enforces deterministic policy, produces cryptographically-signed PaymentMandates when authorized, and optionally executes payments in Razorpay Test Mode.
+### Authorization Infrastructure for Autonomous Payments
 
-Quick start
------------
-1. Copy the example env file:
-   cp .env.example .env
-2. (Optional) Fill in RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to enable real Razorpay Test Mode. If left empty, the adapter runs in MOCKED mode.
-3. Start the API locally:
-   uvicorn agenttrust.api:app --reload
-4. Open the product demo in a browser:
-   http://localhost:8000/
-5. Run the test suite:
-   python -m pytest
+> An authorization boundary between autonomous intent and financial execution.
 
-Demo workflow
--------------
-The browser UI at `/` is the simplest end-to-end workflow for AgentTrust:
-- configure a bearer token from `AGENTTRUST_API_TOKENS` if auth is enabled
-- submit an intent and cart with a user public key and intent signature
-- inspect the authorization decision (`ALLOW`, `BLOCK`, or `REQUIRE_APPROVAL`)
-- if approval is required, submit a signed approval decision to `/approvals/{approval_id}/approve`
-- continue the approved flow via `/approvals/{approval_id}/continue` to create the PaymentMandate
-- call `/payments/{payment_id}/execute` only when the user explicitly approves the payment
-- review `/audit` for the complete signed event trail
+![AgentTrust Dashboard](assets\header.png)
 
-Environment variables (.env.example)
------------------------------------
-- AGENTTRUST_DB_URL: optional database URL. Defaults to sqlite:///./agenttrust.db
-- RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET: Razorpay Test Mode credentials. When both are set, the application uses the real Razorpay Test API. Leave blank for local/mock mode.
-- LOG_LEVEL: logging verbosity (DEBUG, INFO, WARNING, ERROR)
-- AGENTTRUST_API_TOKENS: optional JSON map of bearer tokens to principal IDs.
-- AGENTTRUST_SYSTEM_PRIVATE_KEY: externally provisioned raw Ed25519 private key hex.
-- AGENTTRUST_SYSTEM_KEY_ID: non-secret active signing-key identifier.
-- AGENTTRUST_SYSTEM_PUBLIC_KEYS: JSON map of historical key IDs to public-key hex.
+AgentTrust is a security-focused authorization gateway for autonomous payment workflows.
 
-Authentication
---------------
-When `AGENTTRUST_API_TOKENS` is configured, authorization, approval, continuation,
-execution, and audit routes require `Authorization: Bearer <token>`. The server
-derives the principal from the configured token; request body actor/account fields
-are not trusted. `/health` is intentionally public and only checks database
-connectivity. With no token configuration, the pre-M3.9 local demo mode remains
-available for backwards-compatible development tests.
+It sits between an AI agent or application and a payment provider, verifying cryptographically signed user intent, enforcing deterministic authorization policy, requiring explicit approval for higher-risk transactions, and keeping payment execution separate from authorization.
 
-System key identity and rotation
---------------------------------
-Payment mandates persist only the non-secret `system_key_id`. The active private
-key is supplied externally through configuration. Retired public keys may be
-listed in `AGENTTRUST_SYSTEM_PUBLIC_KEYS` so old mandates remain verifiable after
-rotation. Unknown or unavailable key IDs fail closed. Private keys and bearer
-tokens are never persisted, audited, logged, or returned by the API.
+> **Core principle:** An agent can request a payment. AgentTrust decides whether that request is authorized, and payment execution remains an explicit action.
 
-Razorpay adapter: mock vs real
------------------------------
-- Mocked mode (default when RAZORPAY_KEY_ID or RAZORPAY_KEY_SECRET are empty):
-  - The adapter returns deterministic fake order IDs (order_mock_<hex>). Use this for local development and tests.
-- Real Razorpay Test Mode: set both RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to your Razorpay test credentials. The adapter will call the Razorpay Orders API and persist the returned order ID.
+---
 
-Reservation semantics and idempotency
-------------------------------------
-To prevent duplicate external orders (double-spend), AgentTrust uses a small DB-backed reservation step before creating a Razorpay order:
+## Architecture
+![AgentTrust Architecture](assets\architecture.png)
 
-1. Adapter attempts to insert a consumed nonce record: (mandate_type="payment_execution", nonce=payment_id). This is an atomic DB insert guarded by a unique constraint.
-2. If the insert succeeds, the process "owns" the right to create the external order and proceeds to call Razorpay.
-3. If the insert fails due to uniqueness (IntegrityError), it means another worker/process already reserved or created the order. The adapter returns an error code `concurrent_execution_in_progress`; client should retry with backoff, or call the /payments/{payment_id}/execute endpoint again later to reuse the persisted order.
-4. On Razorpay API failure, the reservation is released (deleted) so subsequent retries can attempt creation again.
+---
 
-Client retry guidance
----------------------
-- If a client receives `concurrent_execution_in_progress`, it should back off (exponential backoff) and retry.
-- Do NOT retry aggressively — prefer progressive backoff to reduce the thundering herd.
-- The payment_id (PaymentMandate ID) is the idempotency identity for payment creation. Clients may store it and retry the same idempotency identity safely.
+## Core Workflow
 
-Audit & transactional notes
----------------------------
-- Audit events are persistent and tamper-evident via a SHA-256 hash chain. The audit chain survives reload and detects tampering.
-- Currently, audit event persistence is committed separately from some decision/payment writes (single-commit-per-repo). This simplifies early development but can lead to temporary out-of-sync states if a subsequent commit fails. Recommended future improvement: group decision + audit + payment metadata writes into a single DB transaction for atomicity.
+```text
+IntentMandate
+     │
+     ▼
+Signature Verification
+     │
+     ▼
+Deterministic Policy Evaluation
+     │
+     ├──────────────┐
+     ▼              ▼
+   BLOCK          ALLOW
+                      │
+                      ▼
+               PaymentMandate
+                      │
+                      ▼
+             Explicit Execution
+                      │
+                      ▼
+                 Razorpay / Mock
+```
 
-Concurrency and durability
--------------------------
-- Durable replay protection for intents/carts uses DB uniqueness constraints and repository-level atomic insert+commit semantics. This prevents replays being consumed twice.
-- The payment reservation ensures a single creator for Razorpay orders across concurrent requests. A parallel test suite exercises these behaviors.
+For transactions above the configured approval threshold:
 
-Testing
--------
-- Run the full test suite with: python -m pytest
-- The project includes concurrency tests that validate: concurrent authorize requests, concurrent payment execution, and Razorpay failure→retry behavior.
+```text
+Intent
+  │
+  ▼
+Authorization
+  │
+  ▼
+REQUIRE_APPROVAL
+  │
+  ▼
+Signed Approval
+  │
+  ▼
+Approved Continuation
+  │
+  ▼
+PaymentMandate
+  │
+  ▼
+Explicit Payment Execution
+  │
+  ▼
+Razorpay / Mock
+```
 
-Security notes
---------------
-- The user's private key must never be stored on AgentTrust; the system only receives the user's public key and signature and verifies them on every request.
-- AgentTrust signs PaymentMandates with its system key generated at startup (for demo). In a production design, the system key must be managed securely and rotated per policy.
+Authorization, approval, and execution are deliberately separate stages.
 
-Contact / Next steps
---------------------
-- To harden the system further, consider:
-  - Grouping audit + decision + payment persistence into a single DB transaction
-  - Leaving a failure-marker with TTL on reservations to avoid repeated retries when Razorpay is degraded
-  - Adding operational observability for reservation failures and API latency
+---
+
+## What AgentTrust Provides
+
+### Cryptographically Signed Intent
+
+Clients submit an `IntentMandate` and `CartMandate` together with:
+
+- Ed25519 public key
+- Ed25519 signature
+- Intent identifier
+- Expiration
+- Nonce
+- Maximum authorized amount
+- Currency
+- Allowed merchants
+- Allowed categories
+
+AgentTrust verifies the signature before evaluating the request.
+
+**User private keys are never stored by AgentTrust.**
+
+### Deterministic Policy Enforcement
+
+Authorization is evaluated through deterministic policy checks including:
+
+- Expiration
+- Signature validity
+- Intent/cart linkage
+- Authorized amount
+- Merchant allowlists
+- Category restrictions
+- Currency
+- Cart total consistency
+- Transaction limits
+- Velocity limits
+- Approval thresholds
+
+The authorization result is one of:
+
+```text
+ALLOW
+BLOCK
+REQUIRE_APPROVAL
+```
+
+### Approval Gating
+
+Transactions requiring additional authorization create a persistent approval request.
+
+Approval decisions are themselves cryptographically signed using Ed25519.
+
+AgentTrust verifies:
+
+- Approval state
+- Approval expiration
+- Authenticated principal
+- Decision maker identity
+- Approval signature
+- Signed decision contents
+
+An approval must be explicitly continued before a `PaymentMandate` is created.
+
+### Explicit Payment Execution
+
+Authorization does **not** automatically execute a payment.
+
+After an approved flow produces a `PaymentMandate`, payment execution requires an explicit request:
+
+```http
+POST /payments/{payment_id}/execute
+```
+
+Before execution, AgentTrust validates the payment mandate, authorization state, approval state, expiration, and system signature.
+
+---
+
+## Authentication & Identity
+
+Optional bearer authentication is provided through:
+
+```text
+AGENTTRUST_API_TOKENS
+```
+
+Example:
+
+```json
+{
+  "demo-token": "demo-user",
+  "ops-token": "operator"
+}
+```
+
+Protected routes receive:
+
+```http
+Authorization: Bearer <token>
+```
+
+The authenticated principal is derived from the configured token.
+
+Client-supplied actor/account fields are **not trusted** for identity-sensitive authorization decisions.
+
+`/health` remains publicly accessible.
+
+For local development, leaving `AGENTTRUST_API_TOKENS` empty preserves the legacy local development mode.
+
+---
+
+## Cryptography
+
+AgentTrust uses **Ed25519** for signing and verification.
+
+The system supports signed:
+
+- `IntentMandate`
+- `ApprovalDecision`
+- `PaymentMandate`
+
+Signed payloads use deterministic canonical JSON serialization so that both sides operate on the same signing bytes.
+
+### Canonicalization
+
+Canonicalization:
+
+- Sorts JSON keys
+- Uses compact separators
+- Removes `None` values
+- Normalizes timestamps to UTC
+- Produces deterministic serialized bytes
+
+The system signing key is externally provisioned.
+
+`PaymentMandate`s persist the non-secret `system_key_id`, while private keys are never persisted.
+
+Historical public keys can be configured to support system-key rotation.
+
+Unknown or unavailable system key IDs fail closed.
+
+---
+
+## Audit Trail
+
+AgentTrust persists authorization, approval, payment, and related security events.
+
+Audit events form a SHA-256 hash chain:
+
+```text
+Event N-1
+    │
+    ▼
+Event N
+    │
+    ▼
+Event N+1
+```
+
+Each event references the previous event's hash.
+
+The chain can be verified through:
+
+```http
+GET /audit
+```
+
+Tampering with the event sequence or event contents causes verification to fail.
+
+---
+
+## Payment Integration
+
+AgentTrust includes a **Razorpay payment adapter**.
+
+### Mock Mode
+
+When Razorpay credentials are not configured, the adapter operates in mocked mode.
+
+Example result:
+
+```json
+{
+  "success": true,
+  "order_id": "order_mock_dff4b599",
+  "message": "Razorpay order created",
+  "is_mocked": true
+}
+```
+
+Mock mode is intended for local development and testing.
+
+### Razorpay Test Mode
+
+Configure:
+
+```text
+RAZORPAY_KEY_ID
+RAZORPAY_KEY_SECRET
+```
+
+When both are present, AgentTrust uses the Razorpay Orders API in Test Mode and persists the resulting order ID.
+
+---
+
+## Replay, Idempotency & Concurrency
+
+AgentTrust uses persistent database constraints and reservation semantics to protect payment workflows.
+
+### Replay Protection
+
+Intent and cart replay protection uses database uniqueness constraints and repository-level atomic insertion.
+
+### Payment Execution Reservation
+
+Before creating an external payment order, the payment execution identity is atomically reserved.
+
+This prevents concurrent requests from independently creating duplicate external orders.
+
+If another worker already owns the reservation, the API can return:
+
+```text
+concurrent_execution_in_progress
+```
+
+Clients should retry with progressive backoff.
+
+The `payment_id` acts as the idempotency identity for payment creation.
+
+---
+
+## Browser Demo
+
+AgentTrust includes an interactive browser demonstration at:
+
+```text
+/
+```
+
+The demo provides a complete workflow for:
+
+- Bearer-token authentication
+- Intent and cart configuration
+- Browser-side Ed25519 signing
+- Authorization
+- Approval
+- Signed approval decisions
+- Approval continuation
+- Explicit payment execution
+- Audit verification
+- API response inspection
+
+The browser demo uses the same signing formats validated by the backend.
+
+---
+
+## API
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/health` | Service/database health check |
+| `GET` | `/` | Interactive browser demo |
+| `POST` | `/authorize` | Verify intent and evaluate policy |
+| `GET` | `/approvals/{approval_id}` | Retrieve an approval |
+| `POST` | `/approvals/{approval_id}/approve` | Approve a request with a signed decision |
+| `POST` | `/approvals/{approval_id}/reject` | Reject an approval |
+| `POST` | `/approvals/{approval_id}/continue` | Continue an approved authorization |
+| `POST` | `/payment-mandates/{payment_id}/execute` | Execute a payment mandate |
+| `POST` | `/payments/{payment_id}/execute` | Explicitly execute a payment |
+| `GET` | `/audit` | Verify and retrieve the audit trail |
+
+Interactive API documentation is available at:
+
+```text
+/docs
+```
+
+---
+
+## Quick Start
+
+### 1. Configure the environment
+
+Copy the example environment file:
+
+```bash
+cp .env.example .env
+```
+
+### 2. Start the API
+
+```bash
+uvicorn agenttrust.api:app --reload
+```
+
+### 3. Open the browser demo
+
+```text
+http://localhost:8000/
+```
+
+### 4. Open the API documentation
+
+```text
+http://localhost:8000/docs
+```
+
+### 5. Run the tests
+
+```bash
+python -m pytest
+```
+
+---
+
+## Environment Variables
+
+The application supports:
+
+```text
+AGENTTRUST_DB_URL
+AGENTTRUST_API_TOKENS
+
+AGENTTRUST_SYSTEM_PRIVATE_KEY
+AGENTTRUST_SYSTEM_KEY_ID
+AGENTTRUST_SYSTEM_PUBLIC_KEYS
+
+RAZORPAY_KEY_ID
+RAZORPAY_KEY_SECRET
+
+LOG_LEVEL
+```
+
+> **Security:** Never commit real credentials, bearer tokens, private keys, or local databases.
+
+---
+
+## Testing
+
+The test suite covers:
+
+- Cryptographic signing and verification
+- Deterministic authorization policy
+- API integration
+- Approval persistence
+- Approval signatures
+- Approval continuation
+- Authenticated identity enforcement
+- Explicit payment execution
+- Concurrent authorization
+- Concurrent payment execution
+- Replay protection
+- Razorpay failure and retry behavior
+- Transactional durability
+- Browser approval-signature compatibility
+- AI/buyer integration
+
+### Verified Release State
+
+**241 tests passing.**
+
+---
+
+## Project Structure
+
+```text
+AgentTrust/
+├── agenttrust/
+│   ├── api.py
+│   ├── models.py
+│   ├── crypto.py
+│   ├── engine.py
+│   ├── policy.py
+│   ├── verification.py
+│   ├── audit.py
+│   ├── catalog.py
+│   ├── ai_buyer.py
+│   ├── ai_integration.py
+│   ├── llm_models.py
+│   ├── llm_provider.py
+│   ├── db/
+│   ├── repositories/
+│   ├── services/
+│   └── payments/
+├── tests/
+├── demo.py
+├── .env.example
+├── README.md
+└── requirements.txt
+```
+
+---
+
+## Current Limitations
+
+AgentTrust is a **prototype authorization gateway** and is not presented as a production-certified payment network.
+
+Known areas for future hardening include:
+
+- Grouping audit, decision, and payment persistence into a single atomic database transaction
+- Stronger operational observability
+- Improved handling of long-lived payment reservation failures
+- Production-grade secret and key management
+- Deployment and infrastructure hardening
+
+These limitations are separate from the authorization, approval, signature-verification, and explicit-execution controls currently implemented.
+
+---
+
+## Design Principle
+
+AgentTrust is built around a simple separation of responsibilities:
+
+```text
+Intent
+  ≠
+Authorization
+  ≠
+Approval
+  ≠
+Execution
+```
+
+An agent can express an intent.
+
+AgentTrust verifies that intent and evaluates it against deterministic policy.
+
+Higher-risk transactions can require a cryptographically signed approval.
+
+Only an explicit execution action can initiate payment.
+
+> **AgentTrust provides the authorization boundary between autonomous intent and financial execution.**
+
+---
+
+## Security Philosophy
+
+AgentTrust is designed around **least trust and explicit authorization**:
+
+1. **Intent is signed** — requests originate from verifiable cryptographic intent.
+2. **Policy is deterministic** — authorization decisions are governed by explicit rules.
+3. **Approval is separate** — higher-risk actions require an additional signed decision.
+4. **Execution is explicit** — authorization never silently triggers payment execution.
+5. **Identity is authenticated** — sensitive authorization decisions use the authenticated principal rather than untrusted client fields.
+6. **Auditability is preserved** — security-relevant events are persisted in a tamper-evident hash chain.
+7. **Secrets stay external** — private keys and credentials are not persisted by the authorization layer.
+
+---
+
+## Status
+
+**Prototype / Verified Release**
+
+- Authorization gateway: Implemented
+- Ed25519 signing: Implemented
+- Deterministic policy enforcement: Implemented
+- Approval workflow: Implemented
+- Explicit payment execution: Implemented
+- Razorpay integration: Implemented
+- Mock payment mode: Implemented
+- Replay protection: Implemented
+- Concurrent execution protection: Implemented
+- Hash-chained audit trail: Implemented
+- Browser demo: Implemented
+- Test suite: **241 tests passing**
